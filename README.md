@@ -4,37 +4,20 @@ Syncs cost data from **Red Hat Cost Management** (Project Koku) to **Lago** for 
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         lago-sync CLI                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  config.yaml ─── defines customers + resource filters               │
-│       │                                                             │
-│       ▼                                                             │
-│  ┌─────────────┐   HTTP/REST    ┌───────────────────────────────┐  │
-│  │ koku_client │ ◄──────────────│ Cost Management API           │  │
-│  │  (httpx)    │                │ /api/cost-management/v1/      │  │
-│  └──────┬──────┘                │ reports/{aws,azure,gcp,ocp}/  │  │
-│         │                       └───────────────────────────────┘  │
-│         │ cost data (JSON)                                          │
-│         ▼                                                           │
-│  ┌─────────────┐                                                   │
-│  │  lago_sync  │ ── routes costs to customers using filters         │
-│  │             │ ── generates Lago Event per cost line item          │
-│  └──────┬──────┘                                                   │
-│         │                                                           │
-│         │ BatchEvent                                                │
-│         ▼                                                           │
-│  ┌─────────────┐   HTTP/REST    ┌───────────────────────────────┐  │
-│  │ Lago SDK    │ ──────────────►│ Lago API                      │  │
-│  │             │                │ /api/v1/events/batch           │  │
-│  └─────────────┘                └───────────────────────────────┘  │
-│                                                                     │
-│  ┌─────────────┐                                                   │
-│  │  state.db   │ ── SQLite: tracks what has been synced             │
-│  └─────────────┘                                                   │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph lago-sync
+        direction TB
+        CONFIG[config.yaml] --> KOKU[koku_client]
+        KOKU --> SYNC[lago_sync]
+        SYNC --> PUSH[Lago SDK]
+        STATE[(state.db)]
+    end
+
+    CM["Cost Management API<br/>/reports/&#123;provider&#125;/costs/"] -->|cost data JSON| KOKU
+    PUSH -->|POST /events/batch| LAGO[Lago API]
+    LAGO --> INV[Invoices]
+    STATE -.->|tracks synced dates| SYNC
 ```
 
 ---
