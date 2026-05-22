@@ -1,0 +1,86 @@
+{
+  "meta": {
+    "count": 2,
+    "limit": 100,
+    "offset": 0,
+    "group_by": {"account": ["*"], "service": ["*"]},
+    "filter": {"resolution": "daily", "time_scope_value": "-10"},
+    "order_by": {},
+    "total": {
+      "cost": {"raw": {"value": 2500.00, "units": "USD"}, "markup": {"value": 250.00, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 2750.00, "units": "USD"}},
+      "infrastructure": {"raw": {"value": 2500.00, "units": "USD"}, "markup": {"value": 250.00, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 2750.00, "units": "USD"}},
+      "supplementary": {"raw": {"value": 0.0, "units": "USD"}, "markup": {"value": 0.0, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 0.0, "units": "USD"}}
+    }
+  },
+  "links": {"first": "/api/cost-management/v1/reports/aws/costs/?limit=100&offset=0", "next": null, "previous": null, "last": "/api/cost-management/v1/reports/aws/costs/?limit=100&offset=0"},
+  "data": [
+    {
+      "date": "2024-01-15",
+      "accounts": [
+        {
+          "account": "123456789012",
+          "services": [
+            {
+              "service": "AmazonEC2",
+              "values": [
+                {
+                  "date": "2024-01-15",
+                  "account": "123456789012",
+                  "account_alias": "production",
+                  "service": "AmazonEC2",
+                  "region": "us-east-1",
+                  "source_uuid": ["550e8400-e29b-41d4-a716-446655440000"],
+                  "infrastructure": {"raw": {"value": 1200.50, "units": "USD"}, "markup": {"value": 120.05, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 1320.55, "units": "USD"}},
+                  "supplementary": {"raw": {"value": 0.0, "units": "USD"}, "markup": {"value": 0.0, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 0.0, "units": "USD"}},
+                  "cost": {"raw": {"value": 1200.50, "units": "USD"}, "markup": {"value": 120.05, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 1320.55, "units": "USD"}}
+                }
+              ]
+            },
+            {
+              "service": "AmazonS3",
+              "values": [
+                {
+                  "date": "2024-01-15",
+                  "account": "123456789012",
+                  "account_alias": "production",
+                  "service": "AmazonS3",
+                  "region": "us-east-1",
+                  "source_uuid": ["550e8400-e29b-41d4-a716-446655440000"],
+                  "infrastructure": {"raw": {"value": 45.30, "units": "USD"}, "markup": {"value": 4.53, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 49.83, "units": "USD"}},
+                  "supplementary": {"raw": {"value": 0.0, "units": "USD"}, "markup": {"value": 0.0, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 0.0, "units": "USD"}},
+                  "cost": {"raw": {"value": 45.30, "units": "USD"}, "markup": {"value": 4.53, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 49.83, "units": "USD"}}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "date": "2024-01-16",
+      "accounts": [
+        {
+          "account": "123456789012",
+          "services": [
+            {
+              "service": "AmazonEC2",
+              "values": [
+                {
+                  "date": "2024-01-16",
+                  "account": "123456789012",
+                  "account_alias": "production",
+                  "service": "AmazonEC2",
+                  "region": "us-east-1",
+                  "source_uuid": ["550e8400-e29b-41d4-a716-446655440000"],
+                  "infrastructure": {"raw": {"value": 1100.00, "units": "USD"}, "markup": {"value": 110.00, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 1210.00, "units": "USD"}},
+                  "supplementary": {"raw": {"value": 0.0, "units": "USD"}, "markup": {"value": 0.0, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 0.0, "units": "USD"}},
+                  "cost": {"raw": {"value": 1100.00, "units": "USD"}, "markup": {"value": 110.00, "units": "USD"}, "usage": {"value": 0.0, "units": "USD"}, "total": {"value": 1210.00, "units": "USD"}}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

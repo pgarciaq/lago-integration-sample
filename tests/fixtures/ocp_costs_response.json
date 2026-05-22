@@ -1,0 +1,57 @@
+{
+  "meta": {
+    "count": 1,
+    "limit": 100,
+    "offset": 0,
+    "group_by": {"cluster": ["*"], "project": ["*"]},
+    "filter": {"resolution": "daily"},
+    "total": {
+      "cost": {"raw": {"value": 500.0, "units": "USD"}, "usage": {"value": 400.0, "units": "USD"}, "markup": {"value": 50.0, "units": "USD"}, "total": {"value": 950.0, "units": "USD"}, "distributed": {"value": 115.0, "units": "USD"}, "platform_distributed": {"value": 75.0, "units": "USD"}, "worker_unallocated_distributed": {"value": 25.0, "units": "USD"}, "network_unattributed_distributed": {"value": 10.0, "units": "USD"}, "storage_unattributed_distributed": {"value": 5.0, "units": "USD"}, "gpu_unallocated_distributed": {"value": 0.0, "units": "USD"}}
+    }
+  },
+  "links": {"first": "/api/cost-management/v1/reports/openshift/costs/?limit=100&offset=0", "next": null, "previous": null, "last": "/api/cost-management/v1/reports/openshift/costs/?limit=100&offset=0"},
+  "data": [
+    {
+      "date": "2024-01-15",
+      "clusters": [
+        {
+          "cluster": "prod-cluster-abc",
+          "projects": [
+            {
+              "project": "my-app",
+              "values": [
+                {
+                  "date": "2024-01-15",
+                  "project": "my-app",
+                  "cluster": "prod-cluster-abc",
+                  "clusters": ["prod-cluster"],
+                  "classification": "project",
+                  "source_uuid": ["660e8400-e29b-41d4-a716-446655440001"],
+                  "infrastructure": {"raw": {"value": 500.0, "units": "USD"}, "usage": {"value": 300.0, "units": "USD"}, "markup": {"value": 50.0, "units": "USD"}, "distributed": {"value": 0.0, "units": "USD"}, "total": {"value": 850.0, "units": "USD"}},
+                  "supplementary": {"raw": {"value": 0.0, "units": "USD"}, "usage": {"value": 100.0, "units": "USD"}, "markup": {"value": 0.0, "units": "USD"}, "distributed": {"value": 0.0, "units": "USD"}, "total": {"value": 100.0, "units": "USD"}},
+                  "cost": {"raw": {"value": 500.0, "units": "USD"}, "usage": {"value": 400.0, "units": "USD"}, "markup": {"value": 50.0, "units": "USD"}, "total": {"value": 950.0, "units": "USD"}, "distributed": {"value": 115.0, "units": "USD"}, "platform_distributed": {"value": 75.0, "units": "USD"}, "worker_unallocated_distributed": {"value": 25.0, "units": "USD"}, "network_unattributed_distributed": {"value": 10.0, "units": "USD"}, "storage_unattributed_distributed": {"value": 5.0, "units": "USD"}, "gpu_unallocated_distributed": {"value": 0.0, "units": "USD"}}
+                }
+              ]
+            },
+            {
+              "project": "monitoring",
+              "values": [
+                {
+                  "date": "2024-01-15",
+                  "project": "monitoring",
+                  "cluster": "prod-cluster-abc",
+                  "clusters": ["prod-cluster"],
+                  "classification": "project",
+                  "source_uuid": ["660e8400-e29b-41d4-a716-446655440001"],
+                  "infrastructure": {"raw": {"value": 100.0, "units": "USD"}, "usage": {"value": 50.0, "units": "USD"}, "markup": {"value": 10.0, "units": "USD"}, "distributed": {"value": 0.0, "units": "USD"}, "total": {"value": 160.0, "units": "USD"}},
+                  "supplementary": {"raw": {"value": 0.0, "units": "USD"}, "usage": {"value": 20.0, "units": "USD"}, "markup": {"value": 0.0, "units": "USD"}, "distributed": {"value": 0.0, "units": "USD"}, "total": {"value": 20.0, "units": "USD"}},
+                  "cost": {"raw": {"value": 100.0, "units": "USD"}, "usage": {"value": 70.0, "units": "USD"}, "markup": {"value": 10.0, "units": "USD"}, "total": {"value": 180.0, "units": "USD"}, "distributed": {"value": 30.0, "units": "USD"}, "platform_distributed": {"value": 20.0, "units": "USD"}, "worker_unallocated_distributed": {"value": 5.0, "units": "USD"}, "network_unattributed_distributed": {"value": 3.0, "units": "USD"}, "storage_unattributed_distributed": {"value": 2.0, "units": "USD"}, "gpu_unallocated_distributed": {"value": 0.0, "units": "USD"}}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
