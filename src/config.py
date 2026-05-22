@@ -81,6 +81,28 @@ class LagoConfig:
 @dataclass
 class SyncConfig:
     ocp_include_overhead: bool = True
+    invoice_group_by: dict[str, list[str]] = field(default_factory=dict)
+
+    def get_invoice_group_by(self, provider: str) -> list[str]:
+        """Get the invoice grouping dimensions for a provider.
+
+        These become Lago pricing_group_keys on the charge, producing
+        one invoice line item per unique combination of these dimension values.
+        """
+        if provider in self.invoice_group_by:
+            return self.invoice_group_by[provider]
+        return _default_invoice_group_by(provider)
+
+
+def _default_invoice_group_by(provider: str) -> list[str]:
+    """Default dimensions for invoice itemization per provider."""
+    defaults = {
+        "aws": ["account", "service"],
+        "azure": ["subscription_guid", "service_name"],
+        "gcp": ["account", "service"],
+        "openshift": ["project", "cluster"],
+    }
+    return defaults.get(provider, [])
 
 
 @dataclass
@@ -245,6 +267,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
         ),
         sync=SyncConfig(
             ocp_include_overhead=sync_data.get("ocp_include_overhead", True),
+            invoice_group_by=sync_data.get("invoice_group_by", {}),
         ),
         customers=customers,
     )

@@ -149,6 +149,14 @@ cost_management:
 sync:
   ocp_include_overhead: true            # Include distributed platform/worker costs
 
+  # Controls what appears as separate line items on the Lago invoice.
+  # Each unique combination of these properties becomes one fee (line item).
+  invoice_group_by:
+    aws: ["account", "service"]         # One line per AWS account + service
+    azure: ["subscription_guid", "service_name"]
+    gcp: ["account", "service"]
+    openshift: ["project", "cluster"]   # One line per namespace + cluster
+
 # ─── Customer definitions ──────────────────────────────────────────
 customers:
   - external_id: "customer_acme"        # Becomes the Lago customer ID
@@ -346,6 +354,45 @@ Charges are configured with `charge_model: standard` and `amount: 1`. This means
 - The `cost_amount` property in events contains the actual dollar value
 - `sum_agg` on `cost_amount` gives the total cost
 - Effective rate: 1:1 pass-through of Cost Management costs to invoice
+
+### Invoice itemization (`pricing_group_keys`)
+
+By default, charges are created with `pricing_group_keys` that produce **per-dimension line items** on the invoice. For example, with the default OpenShift grouping (`["project", "cluster"]`), an invoice looks like:
+
+```
+OCP Daily Cost (project=frontend, cluster=prod-01) ......... $  420.00
+OCP Daily Cost (project=backend, cluster=prod-01) .......... $  890.00
+OCP Daily Cost (project=monitoring, cluster=prod-01) ....... $  150.00
+OCP Daily Overhead (project=frontend, cluster=prod-01) ..... $   63.00
+OCP Daily Overhead (project=backend, cluster=prod-01) ...... $  133.50
+─────────────────────────────────────────────────────────────────────
+Total                                                        $1,656.50
+```
+
+For AWS with default grouping (`["account", "service"]`):
+
+```
+AWS Daily Cost (account=123456789012, service=AmazonEC2) ... $2,340.00
+AWS Daily Cost (account=123456789012, service=AmazonS3) .... $   89.50
+AWS Daily Cost (account=123456789012, service=AmazonRDS) ... $  620.00
+─────────────────────────────────────────────────────────────────────
+Total                                                        $3,049.50
+```
+
+**Customizing granularity** via `config.yaml`:
+
+```yaml
+sync:
+  invoice_group_by:
+    # More granular: add region
+    aws: ["account", "service", "region"]
+    # Less granular: only by project
+    openshift: ["project"]
+    # No itemization: single line item total
+    gcp: []
+```
+
+If you change `invoice_group_by`, you must re-run `lago-sync bootstrap` to update the charges in Lago. Existing charges from a previous bootstrap will need to be deleted first (in the Lago UI or via API), since the charge endpoint returns 422 for duplicates.
 
 ### Deduplication via `transaction_id`
 

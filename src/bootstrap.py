@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 from lago_python_client import Client
@@ -146,13 +147,20 @@ def _create_charges(config: AppConfig, client: Client, metric_ids: dict[str, str
     }
 
     for code, lago_id in metrics_to_attach:
+        provider = _metric_code_to_provider(code)
+        group_keys = config.sync.get_invoice_group_by(provider) if provider else []
+
+        charge_properties: dict[str, Any] = {"amount": "1"}
+        if group_keys:
+            charge_properties["pricing_group_keys"] = group_keys
+
         charge_payload = {
             "charge": {
                 "billable_metric_id": lago_id,
                 "charge_model": "standard",
                 "pay_in_advance": False,
                 "invoiceable": True,
-                "properties": {"amount": "1"},
+                "properties": charge_properties,
             }
         }
         try:
@@ -163,7 +171,8 @@ def _create_charges(config: AppConfig, client: Client, metric_ids: dict[str, str
                 timeout=30.0,
             )
             if resp.status_code in (200, 201):
-                logger.info("Created charge for metric: %s", code)
+                group_desc = f" (grouped by: {', '.join(group_keys)})" if group_keys else ""
+                logger.info("Created charge for metric: %s%s", code, group_desc)
             elif resp.status_code == 422:
                 logger.info("Charge already exists for metric: %s", code)
             else:

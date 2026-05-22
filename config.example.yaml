@@ -15,6 +15,15 @@ sync:
   # Generate separate overhead line items for OpenShift distributed costs
   ocp_include_overhead: true
 
+  # Invoice itemization: which dimensions produce separate line items on the Lago invoice.
+  # Each key below is a provider, and the value is the list of event properties to group by.
+  # If omitted, defaults are used (shown below). Set to [] for a single totaled line item.
+  invoice_group_by:
+    aws: ["account", "service"]
+    azure: ["subscription_guid", "service_name"]
+    gcp: ["account", "service"]
+    openshift: ["project", "cluster"]
+
 # Each customer represents a billable entity in Lago.
 # Resources define which Cost Management data belongs to that customer.
 # Filter values support glob patterns (e.g., "acme-*" matches "acme-frontend", "acme-api").
