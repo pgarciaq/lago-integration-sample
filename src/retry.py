@@ -27,12 +27,18 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _log_retry(retry_state):
+    logger.warning(
+        "Transient error: %s. Retrying (attempt %d/3)...",
+        retry_state.outcome.exception(),
+        retry_state.attempt_number,
+    )
+
+
 with_retry = retry(
     retry=retry_if_exception(_is_transient),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=30),
-    before_sleep=lambda retry_state: logger.warning(
-        "Retrying after %s (attempt %d)", retry_state.outcome.exception(), retry_state.attempt_number
-    ),
+    before_sleep=_log_retry,
     reraise=True,
 )

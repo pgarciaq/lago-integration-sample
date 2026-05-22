@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from src.config import AppConfig, CostManagementConfig, CustomerConfig, LagoConfig, ResourceFilter, SyncConfig
-from src.lago_sync import LagoSync
+from src.lago_sync import LagoSync, SyncResult
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -27,6 +27,13 @@ def _make_sync(config):
     return sync
 
 
+def _extract(sync, provider, data, customers):
+    """Helper that calls _extract_events with a fresh SyncResult."""
+    result = SyncResult(provider=provider)
+    events = sync._extract_events(provider, data, customers, result)
+    return events, result
+
+
 def test_extract_aws_events_routed_to_customer():
     """Test that AWS cost data is routed to the correct customer."""
     customers = [
@@ -42,10 +49,12 @@ def test_extract_aws_events_routed_to_customer():
     fixture = json.loads((FIXTURES / "aws_costs_response.json").read_text())
     data = fixture["data"]
 
-    events = sync._extract_events("aws", data, customers)
+    events, result = _extract(sync, "aws", data, customers)
 
     # Account 123456789012 matches: day1 has EC2+S3, day2 has EC2 = 3 events
     assert len(events) == 3
+    assert result.leaves_matched == 3
+    assert result.leaves_unmatched == 0
 
     ec2_event = events[0]
     assert ec2_event.code == "aws_daily_cost"
@@ -70,8 +79,10 @@ def test_unmatched_costs_not_routed():
     fixture = json.loads((FIXTURES / "aws_costs_response.json").read_text())
     data = fixture["data"]
 
-    events = sync._extract_events("aws", data, customers)
+    events, result = _extract(sync, "aws", data, customers)
     assert len(events) == 0
+    assert result.leaves_matched == 0
+    assert result.leaves_unmatched == 3
 
 
 def test_ocp_events_with_overhead():
@@ -89,7 +100,7 @@ def test_ocp_events_with_overhead():
     fixture = json.loads((FIXTURES / "ocp_costs_response.json").read_text())
     data = fixture["data"]
 
-    events = sync._extract_events("openshift", data, customers)
+    events, result = _extract(sync, "openshift", data, customers)
 
     # my-app matches: 1 direct + 1 overhead = 2 events
     assert len(events) == 2
@@ -114,7 +125,7 @@ def test_ocp_events_without_overhead():
     fixture = json.loads((FIXTURES / "ocp_costs_response.json").read_text())
     data = fixture["data"]
 
-    events = sync._extract_events("openshift", data, customers)
+    events, result = _extract(sync, "openshift", data, customers)
     assert len(events) == 1
     assert events[0].code == "ocp_daily_cost"
 
@@ -134,11 +145,12 @@ def test_glob_pattern_matching():
     fixture = json.loads((FIXTURES / "ocp_costs_response.json").read_text())
     data = fixture["data"]
 
-    events = sync._extract_events("openshift", data, customers)
+    events, result = _extract(sync, "openshift", data, customers)
 
     # Both "my-app" and "monitoring" match "m*" pattern
     # 2 projects x (1 direct + 1 overhead) = 4 events
     assert len(events) == 4
+    assert result.leaves_matched == 2
 
 
 def test_deduplication_deterministic():
@@ -156,8 +168,8 @@ def test_deduplication_deterministic():
     fixture = json.loads((FIXTURES / "aws_costs_response.json").read_text())
     data = fixture["data"]
 
-    events_first = sync._extract_events("aws", data, customers)
-    events_second = sync._extract_events("aws", data, customers)
+    events_first, _ = _extract(sync, "aws", data, customers)
+    events_second, _ = _extract(sync, "aws", data, customers)
 
     txn_ids_first = [e.transaction_id for e in events_first]
     txn_ids_second = [e.transaction_id for e in events_second]
@@ -175,7 +187,6 @@ def test_multiple_customers_same_provider():
         CustomerConfig(
             external_id="cust_b",
             name="B",
-            # Also matches the same account (shared cost scenario)
             resources=[ResourceFilter(provider="aws", filter={"account": ["123456789012"]})],
         ),
     ]
@@ -185,7 +196,7 @@ def test_multiple_customers_same_provider():
     fixture = json.loads((FIXTURES / "aws_costs_response.json").read_text())
     data = fixture["data"]
 
-    events = sync._extract_events("aws", data, customers)
+    events, result = _extract(sync, "aws", data, customers)
 
     # 3 leaf items x 2 customers = 6 events
     assert len(events) == 6
@@ -193,3 +204,51 @@ def test_multiple_customers_same_provider():
     cust_b_events = [e for e in events if "cust_b" in e.transaction_id]
     assert len(cust_a_events) == 3
     assert len(cust_b_events) == 3
+
+
+def test_sync_provider_dry_run():
+    """Test that dry_run=True does not call the Lago client."""
+    customers = [
+        CustomerConfig(
+            external_id="cust_acme",
+            name="Acme",
+            resources=[ResourceFilter(provider="aws", filter={"account": ["123456789012"]})],
+        ),
+    ]
+    config = _make_config(customers)
+    sync = _make_sync(config)
+
+    fixture = json.loads((FIXTURES / "aws_costs_response.json").read_text())
+    data = fixture["data"]
+
+    result = sync.sync_provider("aws", data, customers, dry_run=True)
+
+    assert result.events_sent == 3
+    assert result.batches_succeeded == 0  # No actual batches sent
+    sync.client.events.batch_create.assert_not_called()
+
+
+def test_partial_batch_failure():
+    """Test that a failed batch doesn't prevent subsequent batches from sending."""
+    customers = [
+        CustomerConfig(
+            external_id="cust_acme",
+            name="Acme",
+            resources=[ResourceFilter(provider="aws", filter={"account": ["123456789012"]})],
+        ),
+    ]
+    config = _make_config(customers)
+    sync = _make_sync(config)
+
+    fixture = json.loads((FIXTURES / "aws_costs_response.json").read_text())
+    data = fixture["data"]
+
+    # Make batch_create fail on first call, succeed on subsequent
+    sync.client.events.batch_create.side_effect = [Exception("API down"), None]
+
+    # With batch size 100, all 3 events fit in one batch, so this tests 1-batch failure
+    result = sync.sync_provider("aws", data, customers, dry_run=False)
+
+    assert result.batches_failed == 1
+    assert result.events_failed == 3
+    assert len(result.errors) == 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,6 +11,7 @@ from lago_python_client import Client
 from lago_python_client.models.event import BatchEvent, Event
 
 from src.config import AppConfig, CustomerConfig
+from src.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,6 @@ PROVIDER_METRIC_CODE = {
     "openshift": "ocp_daily_cost",
 }
 
-# Plural key names used by Koku's nested response format
 DIMENSION_PLURAL_KEYS = {
     "account": "accounts",
     "service": "services",
@@ -39,6 +40,47 @@ DIMENSION_PLURAL_KEYS = {
 }
 
 
+@dataclass
+class SyncResult:
+    """Tracks sync statistics for observability."""
+
+    provider: str
+    events_sent: int = 0
+    events_failed: int = 0
+    leaves_matched: int = 0
+    leaves_unmatched: int = 0
+    batches_succeeded: int = 0
+    batches_failed: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def total_leaves(self) -> int:
+        return self.leaves_matched + self.leaves_unmatched
+
+    def log_summary(self):
+        logger.info(
+            "Sync result for %s: %d events sent, %d failed | "
+            "%d/%d leaves matched | %d/%d batches succeeded",
+            self.provider,
+            self.events_sent,
+            self.events_failed,
+            self.leaves_matched,
+            self.total_leaves,
+            self.batches_succeeded,
+            self.batches_succeeded + self.batches_failed,
+        )
+        if self.leaves_unmatched > 0:
+            logger.warning(
+                "%d cost items for %s did not match any customer filter. "
+                "These costs will NOT appear on any invoice. "
+                "Check your config.yaml resource filters.",
+                self.leaves_unmatched,
+                self.provider,
+            )
+        for error in self.errors:
+            logger.error("  Batch error: %s", error)
+
+
 class LagoSync:
     """Transforms Koku cost data into Lago events routed per customer."""
 
@@ -51,19 +93,44 @@ class LagoSync:
         self.org_id = config.cost_management.org_id
 
     def sync_provider(
-        self, provider: str, data: list[dict[str, Any]], customers: list[CustomerConfig]
-    ) -> int:
+        self,
+        provider: str,
+        data: list[dict[str, Any]],
+        customers: list[CustomerConfig],
+        dry_run: bool = False,
+    ) -> SyncResult:
         """Convert Koku report data into Lago events routed to appropriate customers.
 
-        Returns the total number of events sent.
+        Returns a SyncResult with detailed statistics.
         """
-        events = self._extract_events(provider, data, customers)
-        self._push_events(events)
-        logger.info("Synced %d events for provider %s", len(events), provider)
-        return len(events)
+        result = SyncResult(provider=provider)
+        events = self._extract_events(provider, data, customers, result)
+
+        if dry_run:
+            result.events_sent = len(events)
+            logger.info("[DRY RUN] Would send %d events for %s", len(events), provider)
+            for event in events[:5]:
+                logger.info(
+                    "  [DRY RUN] %s -> %s | %s | cost_amount=%s",
+                    event.code,
+                    event.external_subscription_id,
+                    event.transaction_id[:60],
+                    event.properties.get("cost_amount", "?"),
+                )
+            if len(events) > 5:
+                logger.info("  [DRY RUN] ... and %d more events", len(events) - 5)
+        else:
+            self._push_events(events, result)
+
+        result.log_summary()
+        return result
 
     def _extract_events(
-        self, provider: str, data: list[dict[str, Any]], customers: list[CustomerConfig]
+        self,
+        provider: str,
+        data: list[dict[str, Any]],
+        customers: list[CustomerConfig],
+        result: SyncResult,
     ) -> list[Event]:
         """Walk the nested Koku response tree and produce events per leaf per customer."""
         events: list[Event] = []
@@ -77,6 +144,7 @@ class LagoSync:
                 dimensions={},
                 customers=customers,
                 events=events,
+                result=result,
             )
         return events
 
@@ -88,37 +156,34 @@ class LagoSync:
         dimensions: dict[str, str],
         customers: list[CustomerConfig],
         events: list[Event],
+        result: SyncResult,
     ):
         """Recursively descend the Koku nested response until we reach 'values' arrays."""
         if "values" in node:
             for leaf in node["values"]:
                 leaf_dims = {**dimensions}
-                # Capture any additional dimension values from the leaf itself
                 for singular in DIMENSION_PLURAL_KEYS:
                     if singular in leaf and singular not in leaf_dims:
                         val = leaf[singular]
                         if isinstance(val, str):
                             leaf_dims[singular] = val
-                # Also capture tag values from leaf (tag:key format)
                 for key, val in leaf.items():
                     if key.startswith("tag:") and isinstance(val, str):
                         leaf_dims[key] = val
 
-                self._route_leaf(leaf, provider, bucket_date, leaf_dims, customers, events)
+                self._route_leaf(leaf, provider, bucket_date, leaf_dims, customers, events, result)
             return
 
-        # Look for plural dimension keys to descend into
         for singular, plural in DIMENSION_PLURAL_KEYS.items():
             if plural in node:
                 for child in node[plural]:
                     child_dims = {**dimensions}
                     if singular in child:
                         child_dims[singular] = str(child[singular])
-                    # Also capture tag values at this nesting level
                     for key, val in child.items():
                         if key.startswith("tag:") and isinstance(val, str):
                             child_dims[key] = val
-                    self._walk_tree(child, provider, bucket_date, child_dims, customers, events)
+                    self._walk_tree(child, provider, bucket_date, child_dims, customers, events, result)
                 return
 
     def _route_leaf(
@@ -129,13 +194,21 @@ class LagoSync:
         dimensions: dict[str, str],
         customers: list[CustomerConfig],
         events: list[Event],
+        result: SyncResult,
     ):
         """Match a leaf to customers and generate events for each match."""
+        matched = False
         for customer in customers:
             if customer.matches_leaf(provider, dimensions):
+                matched = True
                 events.extend(
                     self._leaf_to_events(leaf, provider, bucket_date, dimensions, customer)
                 )
+
+        if matched:
+            result.leaves_matched += 1
+        else:
+            result.leaves_unmatched += 1
 
     def _leaf_to_events(
         self,
@@ -151,14 +224,11 @@ class LagoSync:
         metric_code = PROVIDER_METRIC_CODE[provider]
         subscription_id = f"{customer.external_id}_{provider}"
 
-        # Build dimension string for deduplication
         dim_key = "_".join(str(v) for v in sorted(dimensions.values())) if dimensions else "total"
 
-        # Extract cost values
         cost = leaf.get("cost", {})
         cost_total = self._extract_value(cost, "total")
 
-        # Direct cost event
         properties: dict[str, str] = {"cost_amount": str(cost_total)}
         properties["cost_raw"] = str(self._extract_value(cost, "raw"))
         properties["cost_markup"] = str(self._extract_value(cost, "markup"))
@@ -176,7 +246,6 @@ class LagoSync:
             )
         )
 
-        # OCP distributed overhead as separate event
         if provider == "openshift" and self.config.sync.ocp_include_overhead:
             distributed = self._extract_value(cost, "distributed")
             if distributed and distributed > 0:
@@ -202,12 +271,29 @@ class LagoSync:
 
         return events
 
-    def _push_events(self, events: list[Event]):
-        """Send events to Lago in batches of BATCH_SIZE."""
+    def _push_events(self, events: list[Event], result: SyncResult):
+        """Send events to Lago in batches, continuing on partial failures."""
         for i in range(0, len(events), BATCH_SIZE):
             batch = events[i : i + BATCH_SIZE]
-            self.client.events.batch_create(BatchEvent(events=batch))
-            logger.debug("Pushed batch of %d events (offset %d)", len(batch), i)
+            try:
+                self._send_batch(batch)
+                result.events_sent += len(batch)
+                result.batches_succeeded += 1
+            except Exception as e:
+                result.events_failed += len(batch)
+                result.batches_failed += 1
+                result.errors.append(f"Batch {i // BATCH_SIZE + 1}: {e}")
+                logger.error(
+                    "Batch %d failed (%d events lost): %s. Continuing with next batch.",
+                    i // BATCH_SIZE + 1,
+                    len(batch),
+                    e,
+                )
+
+    @with_retry
+    def _send_batch(self, batch: list[Event]):
+        """Send a single batch to Lago with retry on transient errors."""
+        self.client.events.batch_create(BatchEvent(events=batch))
 
     @staticmethod
     def _extract_value(cost_obj: dict[str, Any], key: str) -> float:

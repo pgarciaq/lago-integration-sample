@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from src.config import AppConfig
+from src.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +65,8 @@ class KokuClient:
         while True:
             params["offset"] = str(offset)
             params["limit"] = str(limit)
-            resp = self._client.get(path, params=params)
-            resp.raise_for_status()
-            body = resp.json()
+
+            body = self._fetch_page(path, params)
 
             data = body.get("data", [])
             all_data.extend(data)
@@ -80,6 +80,13 @@ class KokuClient:
         logger.info("Fetched %d time buckets for %s (%s to %s)", len(all_data), provider, start_date, end_date)
         return all_data, meta
 
+    @with_retry
+    def _fetch_page(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        """Fetch a single page from the API, with retry on transient errors."""
+        resp = self._client.get(path, params=params)
+        resp.raise_for_status()
+        return resp.json()
+
     def _build_params(
         self, provider: str, start_date: date, end_date: date, group_by: list[str]
     ) -> dict[str, str]:
@@ -88,12 +95,10 @@ class KokuClient:
             "filter[start_date]": start_date.isoformat(),
             "filter[end_date]": end_date.isoformat(),
         }
-        # AWS uses amortized cost
         if provider in PROVIDER_COST_TYPE:
             params["cost_type"] = PROVIDER_COST_TYPE[provider]
 
         for dim in group_by:
-            # Tag dimensions use group_by[tag:key_name]=* syntax
             params[f"group_by[{dim}]"] = "*"
         return params
 

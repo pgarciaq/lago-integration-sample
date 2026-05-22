@@ -124,19 +124,34 @@ def _default_group_by(provider: str) -> list[str]:
     return defaults.get(provider, [])
 
 
+class ConfigError(Exception):
+    """Raised when configuration is invalid."""
+
+
 def load_config(config_path: str | Path | None = None) -> AppConfig:
     """Load configuration from a YAML file with env var interpolation.
 
     Falls back to LAGO_SYNC_CONFIG env var, then ./config.yaml.
+    Raises ConfigError with a helpful message if the config is malformed.
     """
     if config_path is None:
         config_path = os.environ.get("LAGO_SYNC_CONFIG", "config.yaml")
 
     path = Path(config_path)
     if not path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {path}")
+        raise FileNotFoundError(
+            f"Configuration file not found: {path}\n"
+            f"  Create one from the template: cp config.example.yaml config.yaml"
+        )
 
-    raw = yaml.safe_load(path.read_text())
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {path}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"Configuration file {path} must be a YAML mapping (dict), got {type(raw).__name__}")
+
     data = _interpolate_recursive(raw)
 
     lago_data = data.get("lago", {})
@@ -144,14 +159,73 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
     sync_data = data.get("sync", {})
     customers_data = data.get("customers", [])
 
+    # Validate required fields
+    if not lago_data.get("api_key"):
+        raise ConfigError(
+            "lago.api_key is required.\n"
+            "  Set it in config.yaml or via the LAGO_API_KEY environment variable.\n"
+            "  Find your API key in the Lago UI: Settings → Developers → API Keys."
+        )
+
+    if not cm_data.get("org_id"):
+        raise ConfigError(
+            "cost_management.org_id is required.\n"
+            "  This is your organization identifier in Cost Management.\n"
+            "  It's used to scope deduplication keys and state tracking."
+        )
+
+    if not customers_data:
+        raise ConfigError(
+            "No customers defined in config.yaml.\n"
+            "  At least one customer with resource filters is required.\n"
+            "  See config.example.yaml for the expected format."
+        )
+
+    # Parse customers
     customers = []
-    for cust in customers_data:
+    for i, cust in enumerate(customers_data):
+        if not isinstance(cust, dict):
+            raise ConfigError(f"customers[{i}]: expected a mapping, got {type(cust).__name__}")
+
+        if "external_id" not in cust:
+            raise ConfigError(
+                f"customers[{i}]: 'external_id' is required.\n"
+                f"  This becomes the Lago customer identifier."
+            )
+        if "name" not in cust:
+            raise ConfigError(f"customers[{i}] ({cust.get('external_id', '?')}): 'name' is required.")
+
         resources = []
-        for res in cust.get("resources", []):
-            resources.append(ResourceFilter(
-                provider=res["provider"],
-                filter=res.get("filter", {}),
-            ))
+        for j, res in enumerate(cust.get("resources", [])):
+            if not isinstance(res, dict):
+                raise ConfigError(
+                    f"customers[{i}].resources[{j}]: expected a mapping, got {type(res).__name__}"
+                )
+            if "provider" not in res:
+                raise ConfigError(
+                    f"customers[{i}].resources[{j}]: 'provider' is required.\n"
+                    f"  Supported providers: aws, azure, gcp, openshift"
+                )
+            provider = res["provider"]
+            if provider not in ("aws", "azure", "gcp", "openshift"):
+                raise ConfigError(
+                    f"customers[{i}].resources[{j}]: unknown provider '{provider}'.\n"
+                    f"  Supported providers: aws, azure, gcp, openshift"
+                )
+            filter_data = res.get("filter", {})
+            if not filter_data:
+                raise ConfigError(
+                    f"customers[{i}].resources[{j}]: 'filter' is required and must not be empty.\n"
+                    f"  Without a filter, all costs for this provider would match.\n"
+                    f"  Example: filter: {{account: ['123456789012']}}"
+                )
+            resources.append(ResourceFilter(provider=provider, filter=filter_data))
+
+        if not resources:
+            raise ConfigError(
+                f"customers[{i}] ({cust['external_id']}): at least one resource block is required."
+            )
+
         customers.append(CustomerConfig(
             external_id=cust["external_id"],
             name=cust["name"],

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config import CustomerConfig, ResourceFilter, load_config
+from src.config import ConfigError, CustomerConfig, ResourceFilter, load_config
 
 
 def _write_config(tmp_path: Path, content: str) -> Path:
@@ -58,7 +58,13 @@ cost_management:
   base_url: "${TEST_KOKU_URL}"
   org_id: "org_1"
 
-customers: []
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: aws
+        filter:
+          account: ["111"]
 """)
     config = load_config(cfg)
 
@@ -78,7 +84,13 @@ lago:
 cost_management:
   org_id: "org_1"
 
-customers: []
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: aws
+        filter:
+          account: ["111"]
 """)
     config = load_config(cfg)
     assert config.lago.api_url == "http://fallback:3000"
@@ -162,3 +174,109 @@ def test_config_file_not_found():
     """Test that a missing config file raises FileNotFoundError."""
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path/config.yaml")
+
+
+def test_missing_api_key_raises_config_error(tmp_path):
+    """Test that missing lago.api_key gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_url: "http://lago:3000"
+cost_management:
+  org_id: "org_1"
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: aws
+        filter:
+          account: ["111"]
+""")
+    with pytest.raises(ConfigError, match="lago.api_key is required"):
+        load_config(cfg)
+
+
+def test_missing_org_id_raises_config_error(tmp_path):
+    """Test that missing org_id gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_key: "key"
+cost_management:
+  base_url: "http://localhost:8000"
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: aws
+        filter:
+          account: ["111"]
+""")
+    with pytest.raises(ConfigError, match="cost_management.org_id is required"):
+        load_config(cfg)
+
+
+def test_empty_customers_raises_config_error(tmp_path):
+    """Test that an empty customers list gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_key: "key"
+cost_management:
+  org_id: "org_1"
+customers: []
+""")
+    with pytest.raises(ConfigError, match="No customers defined"):
+        load_config(cfg)
+
+
+def test_invalid_provider_raises_config_error(tmp_path):
+    """Test that an unsupported provider gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_key: "key"
+cost_management:
+  org_id: "org_1"
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: oracle
+        filter:
+          account: ["111"]
+""")
+    with pytest.raises(ConfigError, match="unknown provider 'oracle'"):
+        load_config(cfg)
+
+
+def test_empty_filter_raises_config_error(tmp_path):
+    """Test that an empty filter gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_key: "key"
+cost_management:
+  org_id: "org_1"
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: aws
+        filter: {}
+""")
+    with pytest.raises(ConfigError, match="filter.*must not be empty"):
+        load_config(cfg)
+
+
+def test_missing_external_id_raises_config_error(tmp_path):
+    """Test that a customer without external_id gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_key: "key"
+cost_management:
+  org_id: "org_1"
+customers:
+  - name: "C1"
+    resources:
+      - provider: aws
+        filter:
+          account: ["111"]
+""")
+    with pytest.raises(ConfigError, match="external_id.*required"):
+        load_config(cfg)

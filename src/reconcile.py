@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
+
+from lago_python_client import Client
+from lago_python_client.exceptions import LagoApiError
 
 from src.config import AppConfig, CustomerConfig
 from src.koku_client import KokuClient
@@ -13,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def reconcile_month(config: AppConfig, month: str) -> list[dict[str, Any]]:
-    """Compare Cost Management totals vs synced event totals for a month.
+    """Compare Cost Management totals vs Lago past usage for a month.
 
     Args:
         config: Application configuration.
@@ -23,15 +26,13 @@ def reconcile_month(config: AppConfig, month: str) -> list[dict[str, Any]]:
         List of reconciliation results per customer per provider.
     """
     start = date.fromisoformat(f"{month}-01")
-    # Last day of month
     if start.month == 12:
-        end = date(start.year + 1, 1, 1)
+        end = date(start.year + 1, 1, 1) - timedelta(days=1)
     else:
-        end = date(start.year, start.month + 1, 1)
-    from datetime import timedelta
-    end = end - timedelta(days=1)
+        end = date(start.year, start.month + 1, 1) - timedelta(days=1)
 
     koku = KokuClient(config)
+    lago_client = Client(api_key=config.lago.api_key, api_url=config.lago.api_url)
     results: list[dict[str, Any]] = []
 
     for provider in config.providers_needed():
@@ -44,24 +45,49 @@ def reconcile_month(config: AppConfig, month: str) -> list[dict[str, Any]]:
             logger.exception("Failed to fetch costs for %s", provider)
             continue
 
-        # Calculate per-customer totals from the data
-        customer_totals = _calculate_customer_totals(provider, data, customers)
+        # Calculate per-customer totals from Cost Management data
+        cm_customer_totals = _calculate_customer_totals(provider, data, customers)
 
-        # Get the overall total from meta
+        # Get Lago usage per customer for comparison
+        lago_customer_totals = _get_lago_usage(lago_client, customers, provider, month)
+
         meta_total = _extract_meta_total(meta)
 
         for customer in customers:
-            customer_total = customer_totals.get(customer.external_id, 0.0)
-            results.append({
+            cm_total = cm_customer_totals.get(customer.external_id, 0.0)
+            lago_total = lago_customer_totals.get(customer.external_id)
+            delta = None
+
+            status = "ok"
+            message = None
+
+            if cm_total == 0:
+                status = "no_data"
+                message = "No cost data in Cost Management for this period"
+            elif lago_total is None:
+                status = "lago_unavailable"
+                message = "Could not retrieve Lago usage (check API key/connectivity)"
+            elif abs(cm_total - lago_total) > 0.01:
+                status = "mismatch"
+                delta = lago_total - cm_total
+                message = f"Delta: ${delta:+.2f} (Lago has {'more' if delta > 0 else 'less'} than Cost Management)"
+
+            result_entry = {
                 "customer_id": customer.external_id,
                 "provider": provider,
                 "month": month,
-                "cost_management_total": customer_total,
-                "status": "ok" if customer_total > 0 else "no_data",
-            })
+                "cost_management_total": cm_total,
+                "lago_total": lago_total,
+                "status": status,
+            }
+            if delta is not None:
+                result_entry["delta"] = delta
+            if message:
+                result_entry["message"] = message
+            results.append(result_entry)
 
-        # Check for unmatched costs (costs that don't belong to any customer)
-        total_matched = sum(customer_totals.values())
+        # Check for unmatched costs
+        total_matched = sum(cm_customer_totals.values())
         unmatched = meta_total - total_matched
         if abs(unmatched) > 0.01:
             results.append({
@@ -69,12 +95,78 @@ def reconcile_month(config: AppConfig, month: str) -> list[dict[str, Any]]:
                 "provider": provider,
                 "month": month,
                 "cost_management_total": unmatched,
+                "lago_total": None,
                 "status": "warning",
-                "message": f"${unmatched:.2f} in costs not matched to any customer",
+                "message": f"${unmatched:.2f} in costs not matched to any customer filter",
             })
 
     koku.close()
     return results
+
+
+def _get_lago_usage(
+    client: Client, customers: list[CustomerConfig], provider: str, month: str
+) -> dict[str, float | None]:
+    """Query Lago past_usage for each customer's subscription for the given month.
+
+    Returns customer_id -> total_amount (or None if query failed).
+    """
+    totals: dict[str, float | None] = {}
+
+    for customer in customers:
+        subscription_id = f"{customer.external_id}_{provider}"
+        try:
+            usage = client.customers.past_usage(
+                customer.external_id,
+                external_subscription_id=subscription_id,
+                options={"page": 1, "per_page": 12},
+            )
+            # past_usage returns usage periods; find the one matching our month
+            amount = _find_period_amount(usage, month)
+            totals[customer.external_id] = amount
+        except LagoApiError as e:
+            if e.status_code == 404:
+                # Customer or subscription doesn't exist in Lago yet
+                totals[customer.external_id] = 0.0
+            else:
+                logger.warning(
+                    "Failed to query Lago usage for %s/%s: %s",
+                    customer.external_id, subscription_id, e,
+                )
+                totals[customer.external_id] = None
+        except Exception as e:
+            logger.warning("Error querying Lago for %s: %s", customer.external_id, e)
+            totals[customer.external_id] = None
+
+    return totals
+
+
+def _find_period_amount(usage_response: Any, month: str) -> float:
+    """Extract the total amount for a given month from Lago's past_usage response."""
+    # The response structure varies by SDK version; handle both list and object forms
+    periods = []
+    if hasattr(usage_response, "usage_periods"):
+        periods = usage_response.usage_periods or []
+    elif isinstance(usage_response, dict):
+        periods = usage_response.get("usage_periods", [])
+    elif isinstance(usage_response, list):
+        periods = usage_response
+
+    for period in periods:
+        # Match by checking if from_datetime starts with our month
+        from_dt = None
+        if hasattr(period, "from_datetime"):
+            from_dt = period.from_datetime
+        elif isinstance(period, dict):
+            from_dt = period.get("from_datetime", "")
+
+        if from_dt and str(from_dt).startswith(month):
+            if hasattr(period, "total_amount_cents"):
+                return float(period.total_amount_cents or 0) / 100.0
+            elif isinstance(period, dict):
+                return float(period.get("total_amount_cents", 0)) / 100.0
+
+    return 0.0
 
 
 def _calculate_customer_totals(
