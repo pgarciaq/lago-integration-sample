@@ -413,6 +413,174 @@ Each customer can have a different currency (set in `config.yaml`). Lago handles
 
 ---
 
+## Taxes
+
+**Taxes are the service provider's responsibility.** This integration pushes cost amounts to Lago; Lago then applies tax rules when generating invoices. You must configure tax handling in Lago.
+
+### How Lago applies taxes
+
+When Lago generates an invoice, it calculates taxes for each fee (line item) based on this hierarchy:
+
+```
+Billing Entity default tax
+  ↓ overridden by
+Customer-level tax (set via tax_codes in config.yaml or Lago UI)
+  ↓ overridden by
+Plan-level tax
+  ↓ overridden by
+Charge-level tax
+  ↓ overridden by
+Tax provider calculation (Avalara/Anrok — overrides everything)
+```
+
+Each level overrides the one above it. If you set a tax rate on a customer, it replaces the billing entity default for that customer's invoices.
+
+### Option A: Manual tax rates (simplest, for small customer counts)
+
+Best for: Fixed known tax rates, few jurisdictions, B2B only.
+
+**Setup:**
+1. Create tax objects in Lago (Settings → Taxes):
+   ```
+   Name: "US Sales Tax CA"     Code: us_sales_tax_ca     Rate: 8.25%
+   Name: "EU VAT Standard"     Code: eu_vat_standard     Rate: 20%
+   Name: "EU Reverse Charge"   Code: eu_reverse_charge   Rate: 0%
+   Name: "Tax Exempt"          Code: tax_exempt           Rate: 0%
+   ```
+
+2. Set a default tax on your billing entity (applies to all customers unless overridden)
+
+3. Assign per-customer tax rates in `config.yaml`:
+   ```yaml
+   customers:
+     - external_id: "customer_acme"
+       name: "Acme Corp"
+       tax_codes: ["us_sales_tax_ca"]   # ← assigns this tax rate
+       address:
+         country: "US"
+         state: "CA"
+         zipcode: "94105"
+
+     - external_id: "customer_globex"
+       name: "Globex GmbH"
+       tax_codes: ["eu_reverse_charge"]  # ← 0% for intra-EU B2B
+       tax_identification_number: "DE123456789"
+       address:
+         country: "DE"
+   ```
+
+4. Run `lago-sync bootstrap` — customers are created with their tax codes and address data.
+
+**Resulting invoice for Acme (CA):**
+```
+AWS Daily Cost (account=123456789012, service=AmazonEC2) ... $2,340.00
+AWS Daily Cost (account=123456789012, service=AmazonS3) .... $   89.50
+─────────────────────────────────────────────────────────────────────
+Subtotal                                                     $2,429.50
+US Sales Tax CA (8.25%)                                      $  200.43
+─────────────────────────────────────────────────────────────────────
+Total                                                        $2,629.93
+```
+
+### Option B: Lago EU Tax Management (automatic for EU businesses)
+
+Best for: EU-based service providers billing EU customers.
+
+**What it does automatically:**
+- Detects whether a customer is in the same EU country as you → applies your country's VAT
+- Validates `tax_identification_number` against EU VIES → if valid B2B in different EU country → 0% reverse charge
+- Handles zipcode-based exceptions (e.g., Canary Islands, French overseas territories)
+- Non-EU customers → 0% tax exempt
+
+**Setup:**
+1. Enable the "Lago EU Taxes" integration in Lago (Settings → Integrations)
+2. Ensure your billing entity has your own country set
+3. In `config.yaml`, provide customer `address.country` and `tax_identification_number`:
+   ```yaml
+   customers:
+     - external_id: "customer_globex"
+       name: "Globex GmbH"
+       tax_identification_number: "DE123456789"  # Validated via VIES
+       address:
+         country: "DE"
+         zipcode: "10115"
+   ```
+4. Run `lago-sync bootstrap` — Lago auto-assigns the correct EU tax rate
+
+**Decision logic (handled by Lago automatically):**
+```
+Customer has tax_identification_number?
+  └─ YES → VIES validates it?
+       └─ YES → Same country as you?
+            └─ YES → Your country's VAT rate (e.g., 20%)
+            └─ NO  → Reverse charge: 0%
+       └─ NO  → Treat as B2C
+  └─ NO  → Check customer.country
+       └─ In EU?  → Your country's VAT rate
+       └─ Not EU? → Tax exempt: 0%
+```
+
+### Option C: Avalara or Anrok (full global tax compliance)
+
+Best for: US sales tax (nexus complexity), global operations, audit requirements.
+
+**What it does:**
+- Calculates taxes per line item based on ShipFrom/ShipTo addresses
+- Handles US state + county + city + special district tax combinations
+- International VAT, GST, consumption taxes
+- Creates tax transactions for reporting and filing
+- Syncs voids, credit notes, and disputes
+
+**Setup:**
+1. Create an account with [Avalara](https://www.avalara.com/) or [Anrok](https://www.anrok.com/)
+2. Enable the integration in Lago (Settings → Integrations → Tax)
+3. Configure nexus jurisdictions in Avalara/Anrok
+4. **Critically:** Every customer must have a valid address (required for tax calculation):
+   ```yaml
+   customers:
+     - external_id: "customer_acme"
+       name: "Acme Corp"
+       address:
+         address_line1: "123 Main Street"
+         city: "San Francisco"
+         state: "CA"
+         zipcode: "94105"
+         country: "US"
+   ```
+5. If address is missing or invalid, Lago will **fail to generate the invoice**
+
+**How it interacts with this integration:**
+- `lago-sync bootstrap` creates customers with addresses from `config.yaml`
+- When Lago finalizes an invoice, it sends line items + addresses to Avalara/Anrok
+- The tax provider returns calculated tax amounts per line item
+- Lago applies them to the invoice automatically
+
+### Which option should you choose?
+
+| Scenario | Recommendation |
+|----------|---------------|
+| All customers in one country, same tax rate | **Option A** — set one default tax on billing entity |
+| EU B2B with mix of same/different countries | **Option B** — auto-detects reverse charge |
+| US customers in multiple states | **Option C (Avalara)** — handles nexus |
+| Global customers, audit/compliance needs | **Option C** — handles everything |
+| Tax-exempt scenario (e.g., internal cost allocation) | **Option A** — create a 0% "tax_exempt" rate |
+
+### Tax fields in `config.yaml`
+
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `tax_identification_number` | VAT/EIN/GST number, used for reverse charge | `"DE123456789"` |
+| `tax_codes` | Explicit tax rate codes to assign (must exist in Lago) | `["eu_vat_standard"]` |
+| `address.country` | ISO 3166 alpha-2, required for tax provider calculation | `"US"`, `"DE"`, `"FR"` |
+| `address.zipcode` | Required by Avalara/Anrok for US, also EU exceptions | `"94105"` |
+| `address.state` | US state code, used by Avalara for nexus | `"CA"` |
+| `email` | Invoice delivery address | `"billing@acme.com"` |
+| `legal_name` | Legal entity name on invoice | `"Acme Corporation Inc."` |
+
+All fields are optional. If omitted, the billing entity's default tax applies.
+
+---
+
 ## Operational Guide
 
 ### Scheduling

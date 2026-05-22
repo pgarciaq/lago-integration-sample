@@ -31,6 +31,18 @@ customers:
   - external_id: "customer_acme"
     name: "Acme Corp"
     currency: "USD"
+    # Tax-relevant fields (optional but recommended for tax compliance)
+    email: "billing@acme.example.com"
+    legal_name: "Acme Corporation Inc."
+    tax_identification_number: "US12-3456789"  # EIN, VAT number, etc.
+    # Assign specific tax rates by code (must exist in Lago first)
+    tax_codes: ["us_standard_sales_tax"]
+    address:
+      address_line1: "123 Main Street"
+      city: "San Francisco"
+      state: "CA"
+      zipcode: "94105"
+      country: "US"  # ISO 3166 alpha-2
     resources:
       # Bill Acme for these two AWS accounts
       - provider: aws
@@ -45,6 +57,14 @@ customers:
   - external_id: "customer_globex"
     name: "Globex Inc"
     currency: "EUR"
+    email: "finance@globex.example.de"
+    legal_name: "Globex GmbH"
+    tax_identification_number: "DE123456789"  # EU VAT number (enables reverse charge)
+    address:
+      address_line1: "Musterstraße 42"
+      city: "Berlin"
+      zipcode: "10115"
+      country: "DE"
     resources:
       # Bill Globex by tag
       - provider: openshift
@@ -57,6 +77,7 @@ customers:
   - external_id: "customer_initech"
     name: "Initech"
     currency: "USD"
+    # No tax fields = uses billing entity default tax rate
     resources:
       # Bill Initech for specific VMs
       - provider: openshift

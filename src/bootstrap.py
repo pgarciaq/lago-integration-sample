@@ -182,16 +182,40 @@ def _create_charges(config: AppConfig, client: Client, metric_ids: dict[str, str
 
 
 def _create_customers(config: AppConfig, client: Client):
-    """Create a Lago customer for each entry in the config."""
+    """Create a Lago customer for each entry in the config, including tax/address data."""
     for customer_config in config.customers:
         try:
-            client.customers.create(
-                Customer(
-                    external_id=customer_config.external_id,
-                    name=customer_config.name,
-                    currency=customer_config.currency,
-                )
-            )
+            customer_kwargs: dict[str, Any] = {
+                "external_id": customer_config.external_id,
+                "name": customer_config.name,
+                "currency": customer_config.currency,
+            }
+
+            if customer_config.email:
+                customer_kwargs["email"] = customer_config.email
+            if customer_config.legal_name:
+                customer_kwargs["legal_name"] = customer_config.legal_name
+            if customer_config.tax_identification_number:
+                customer_kwargs["tax_identification_number"] = customer_config.tax_identification_number
+            if customer_config.tax_codes:
+                customer_kwargs["tax_codes"] = customer_config.tax_codes
+
+            if customer_config.address:
+                addr = customer_config.address
+                if addr.address_line1:
+                    customer_kwargs["address_line1"] = addr.address_line1
+                if addr.address_line2:
+                    customer_kwargs["address_line2"] = addr.address_line2
+                if addr.city:
+                    customer_kwargs["city"] = addr.city
+                if addr.state:
+                    customer_kwargs["state"] = addr.state
+                if addr.zipcode:
+                    customer_kwargs["zipcode"] = addr.zipcode
+                if addr.country:
+                    customer_kwargs["country"] = addr.country
+
+            client.customers.create(Customer(**customer_kwargs))
             logger.info("Created customer: %s (%s)", customer_config.external_id, customer_config.currency)
         except LagoApiError as e:
             if e.status_code == 422:

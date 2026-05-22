@@ -52,6 +52,18 @@ class ResourceFilter:
 
 
 @dataclass
+class CustomerAddress:
+    """Billing address for tax calculation."""
+
+    address_line1: str = ""
+    address_line2: str = ""
+    city: str = ""
+    state: str = ""
+    zipcode: str = ""
+    country: str = ""  # ISO 3166 alpha-2 (e.g., "US", "DE", "FR")
+
+
+@dataclass
 class CustomerConfig:
     """A billable customer and their associated resources."""
 
@@ -59,6 +71,12 @@ class CustomerConfig:
     name: str
     currency: str = "USD"
     resources: list[ResourceFilter] = field(default_factory=list)
+    # Tax-related fields
+    email: str = ""
+    legal_name: str = ""
+    tax_identification_number: str = ""
+    tax_codes: list[str] = field(default_factory=list)
+    address: CustomerAddress | None = None
 
     def matches_leaf(self, provider: str, dimensions: dict[str, str]) -> bool:
         """Return True if any resource filter matches the given dimensions."""
@@ -248,11 +266,29 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
                 f"customers[{i}] ({cust['external_id']}): at least one resource block is required."
             )
 
+        # Parse address if present
+        address = None
+        addr_data = cust.get("address")
+        if addr_data and isinstance(addr_data, dict):
+            address = CustomerAddress(
+                address_line1=addr_data.get("address_line1", ""),
+                address_line2=addr_data.get("address_line2", ""),
+                city=addr_data.get("city", ""),
+                state=addr_data.get("state", ""),
+                zipcode=addr_data.get("zipcode", ""),
+                country=addr_data.get("country", ""),
+            )
+
         customers.append(CustomerConfig(
             external_id=cust["external_id"],
             name=cust["name"],
             currency=cust.get("currency", "USD"),
             resources=resources,
+            email=cust.get("email", ""),
+            legal_name=cust.get("legal_name", ""),
+            tax_identification_number=cust.get("tax_identification_number", ""),
+            tax_codes=cust.get("tax_codes", []),
+            address=address,
         ))
 
     return AppConfig(
