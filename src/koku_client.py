@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from src.config import settings
+from src.config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +19,17 @@ PROVIDER_REPORT_PATHS = {
     "openshift": "reports/openshift/costs/",
 }
 
-PROVIDER_GROUP_BY_MAP = {
-    "aws": lambda s: s.aws_group_by,
-    "azure": lambda s: s.azure_group_by,
-    "gcp": lambda s: s.gcp_group_by,
-    "openshift": lambda s: s.ocp_group_by,
+PROVIDER_COST_TYPE = {
+    "aws": "calculated_amortized_cost",
 }
 
 
 class KokuClient:
     """Fetches cost report data from the Koku API."""
 
-    def __init__(self, base_url: str | None = None, identity: str | None = None):
-        self.base_url = (base_url or settings.koku_base_url).rstrip("/")
-        self.identity = identity or settings.koku_identity
+    def __init__(self, config: AppConfig):
+        self.base_url = config.cost_management.base_url.rstrip("/")
+        self.identity = config.cost_management.identity
         self._client = httpx.Client(
             base_url=self.base_url,
             headers=self._build_headers(),
@@ -50,18 +47,17 @@ class KokuClient:
         provider: str,
         start_date: date,
         end_date: date,
-        group_by: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
+        group_by: list[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Fetch daily cost data for a provider, handling pagination.
 
-        Returns the full list of time-bucketed data objects from the response.
+        Returns (data_list, meta) where data_list is the full list of
+        time-bucketed data objects and meta contains totals.
         """
         path = PROVIDER_REPORT_PATHS[provider]
-        if group_by is None:
-            group_by = PROVIDER_GROUP_BY_MAP[provider](settings)
-
-        params = self._build_params(start_date, end_date, group_by)
+        params = self._build_params(provider, start_date, end_date, group_by)
         all_data: list[dict[str, Any]] = []
+        meta: dict[str, Any] = {}
         offset = 0
         limit = 100
 
@@ -74,25 +70,30 @@ class KokuClient:
 
             data = body.get("data", [])
             all_data.extend(data)
-
             meta = body.get("meta", {})
+
             total_count = meta.get("count", 0)
             offset += limit
             if offset >= total_count:
                 break
 
         logger.info("Fetched %d time buckets for %s (%s to %s)", len(all_data), provider, start_date, end_date)
-        return all_data
+        return all_data, meta
 
-    def _build_params(self, start_date: date, end_date: date, group_by: list[str]) -> dict[str, str]:
+    def _build_params(
+        self, provider: str, start_date: date, end_date: date, group_by: list[str]
+    ) -> dict[str, str]:
         params: dict[str, str] = {
             "filter[resolution]": "daily",
-            "filter[time_scope_value]": "-10",
-            "filter[time_scope_units]": "day",
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
+            "filter[start_date]": start_date.isoformat(),
+            "filter[end_date]": end_date.isoformat(),
         }
+        # AWS uses amortized cost
+        if provider in PROVIDER_COST_TYPE:
+            params["cost_type"] = PROVIDER_COST_TYPE[provider]
+
         for dim in group_by:
+            # Tag dimensions use group_by[tag:key_name]=* syntax
             params[f"group_by[{dim}]"] = "*"
         return params
 

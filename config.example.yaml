@@ -1,0 +1,55 @@
+# lago-integration-sample configuration
+# Environment variables can be referenced as ${VAR_NAME} or ${VAR_NAME:default_value}
+
+lago:
+  api_url: "${LAGO_API_URL:http://localhost:3000}"
+  api_key: "${LAGO_API_KEY}"
+
+cost_management:
+  base_url: "${KOKU_BASE_URL:http://localhost:8000/api/cost-management/v1}"
+  # Base64-encoded x-rh-identity header. Leave empty for local dev mode.
+  identity: "${KOKU_IDENTITY:}"
+  org_id: "org_12345"
+
+sync:
+  # Generate separate overhead line items for OpenShift distributed costs
+  ocp_include_overhead: true
+
+# Each customer represents a billable entity in Lago.
+# Resources define which Cost Management data belongs to that customer.
+# Filter values support glob patterns (e.g., "acme-*" matches "acme-frontend", "acme-api").
+customers:
+  - external_id: "customer_acme"
+    name: "Acme Corp"
+    currency: "USD"
+    resources:
+      # Bill Acme for these two AWS accounts
+      - provider: aws
+        filter:
+          account: ["123456789012", "234567890123"]
+      # And these OpenShift namespaces on a specific cluster
+      - provider: openshift
+        filter:
+          project: ["acme-*"]
+          cluster: ["prod-cluster-01"]
+
+  - external_id: "customer_globex"
+    name: "Globex Inc"
+    currency: "EUR"
+    resources:
+      # Bill Globex by tag
+      - provider: openshift
+        filter:
+          tag:team: ["globex-engineering"]
+      - provider: aws
+        filter:
+          tag:customer: ["globex"]
+
+  - external_id: "customer_initech"
+    name: "Initech"
+    currency: "USD"
+    resources:
+      # Bill Initech for specific VMs
+      - provider: openshift
+        filter:
+          vm_name: ["initech-vm-*"]

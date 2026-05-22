@@ -1,15 +1,15 @@
-"""Maps Koku report data to Lago usage events and pushes them in batches."""
+"""Maps Koku report data to Lago usage events, routing to the correct customer."""
 
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from lago_python_client import Client
 from lago_python_client.models.event import BatchEvent, Event
 
-from src.config import settings
+from src.config import AppConfig, CustomerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -35,44 +35,47 @@ DIMENSION_PLURAL_KEYS = {
     "node": "nodes",
     "az": "azs",
     "product_family": "product_families",
+    "vm_name": "vm_names",
 }
 
 
 class LagoSync:
-    """Transforms Koku cost data into Lago events and sends them."""
+    """Transforms Koku cost data into Lago events routed per customer."""
 
-    def __init__(self, lago_api_key: str | None = None, lago_api_url: str | None = None):
+    def __init__(self, config: AppConfig):
+        self.config = config
         self.client = Client(
-            api_key=lago_api_key or settings.lago_api_key,
-            api_url=lago_api_url or settings.lago_api_url,
+            api_key=config.lago.api_key,
+            api_url=config.lago.api_url,
         )
-        self.org_id = settings.org_id
+        self.org_id = config.cost_management.org_id
 
-    def sync_provider(self, provider: str, data: list[dict[str, Any]]) -> int:
-        """Convert Koku report data for a provider into Lago events and push them.
+    def sync_provider(
+        self, provider: str, data: list[dict[str, Any]], customers: list[CustomerConfig]
+    ) -> int:
+        """Convert Koku report data into Lago events routed to appropriate customers.
 
-        Returns the number of events sent.
+        Returns the total number of events sent.
         """
-        events = self._extract_events(provider, data)
+        events = self._extract_events(provider, data, customers)
         self._push_events(events)
         logger.info("Synced %d events for provider %s", len(events), provider)
         return len(events)
 
-    def _extract_events(self, provider: str, data: list[dict[str, Any]]) -> list[Event]:
-        """Walk the nested Koku response tree and produce one Event per leaf."""
+    def _extract_events(
+        self, provider: str, data: list[dict[str, Any]], customers: list[CustomerConfig]
+    ) -> list[Event]:
+        """Walk the nested Koku response tree and produce events per leaf per customer."""
         events: list[Event] = []
-        metric_code = PROVIDER_METRIC_CODE[provider]
-        subscription_id = f"{self.org_id}_{provider}"
 
         for time_bucket in data:
             bucket_date = time_bucket.get("date", "")
             self._walk_tree(
                 node=time_bucket,
                 provider=provider,
-                metric_code=metric_code,
-                subscription_id=subscription_id,
                 bucket_date=bucket_date,
                 dimensions={},
+                customers=customers,
                 events=events,
             )
         return events
@@ -81,19 +84,27 @@ class LagoSync:
         self,
         node: dict[str, Any],
         provider: str,
-        metric_code: str,
-        subscription_id: str,
         bucket_date: str,
         dimensions: dict[str, str],
+        customers: list[CustomerConfig],
         events: list[Event],
     ):
         """Recursively descend the Koku nested response until we reach 'values' arrays."""
-        # Check for terminal values array
         if "values" in node:
             for leaf in node["values"]:
-                events.extend(
-                    self._leaf_to_events(leaf, provider, metric_code, subscription_id, bucket_date, dimensions)
-                )
+                leaf_dims = {**dimensions}
+                # Capture any additional dimension values from the leaf itself
+                for singular in DIMENSION_PLURAL_KEYS:
+                    if singular in leaf and singular not in leaf_dims:
+                        val = leaf[singular]
+                        if isinstance(val, str):
+                            leaf_dims[singular] = val
+                # Also capture tag values from leaf (tag:key format)
+                for key, val in leaf.items():
+                    if key.startswith("tag:") and isinstance(val, str):
+                        leaf_dims[key] = val
+
+                self._route_leaf(leaf, provider, bucket_date, leaf_dims, customers, events)
             return
 
         # Look for plural dimension keys to descend into
@@ -103,24 +114,45 @@ class LagoSync:
                     child_dims = {**dimensions}
                     if singular in child:
                         child_dims[singular] = str(child[singular])
-                    self._walk_tree(child, provider, metric_code, subscription_id, bucket_date, child_dims, events)
+                    # Also capture tag values at this nesting level
+                    for key, val in child.items():
+                        if key.startswith("tag:") and isinstance(val, str):
+                            child_dims[key] = val
+                    self._walk_tree(child, provider, bucket_date, child_dims, customers, events)
                 return
+
+    def _route_leaf(
+        self,
+        leaf: dict[str, Any],
+        provider: str,
+        bucket_date: str,
+        dimensions: dict[str, str],
+        customers: list[CustomerConfig],
+        events: list[Event],
+    ):
+        """Match a leaf to customers and generate events for each match."""
+        for customer in customers:
+            if customer.matches_leaf(provider, dimensions):
+                events.extend(
+                    self._leaf_to_events(leaf, provider, bucket_date, dimensions, customer)
+                )
 
     def _leaf_to_events(
         self,
         leaf: dict[str, Any],
         provider: str,
-        metric_code: str,
-        subscription_id: str,
         bucket_date: str,
         dimensions: dict[str, str],
+        customer: CustomerConfig,
     ) -> list[Event]:
-        """Convert a single leaf cost object into one or two Lago Events."""
+        """Convert a single leaf cost object into one or two Lago Events for a customer."""
         events: list[Event] = []
         timestamp = self._date_to_unix(bucket_date)
+        metric_code = PROVIDER_METRIC_CODE[provider]
+        subscription_id = f"{customer.external_id}_{provider}"
 
         # Build dimension string for deduplication
-        dim_key = "_".join(f"{v}" for v in dimensions.values()) if dimensions else "total"
+        dim_key = "_".join(str(v) for v in sorted(dimensions.values())) if dimensions else "total"
 
         # Extract cost values
         cost = leaf.get("cost", {})
@@ -133,7 +165,7 @@ class LagoSync:
         properties["cost_usage"] = str(self._extract_value(cost, "usage"))
         properties.update(dimensions)
 
-        txn_id = f"{provider}_{dim_key}_{bucket_date}_direct"
+        txn_id = f"{self.org_id}_{customer.external_id}_{provider}_{dim_key}_{bucket_date}_direct"
         events.append(
             Event(
                 transaction_id=txn_id,
@@ -145,7 +177,7 @@ class LagoSync:
         )
 
         # OCP distributed overhead as separate event
-        if provider == "openshift" and settings.ocp_include_overhead:
+        if provider == "openshift" and self.config.sync.ocp_include_overhead:
             distributed = self._extract_value(cost, "distributed")
             if distributed and distributed > 0:
                 overhead_props: dict[str, str] = {"cost_amount": str(distributed)}
@@ -155,7 +187,9 @@ class LagoSync:
                 overhead_props["storage"] = str(self._extract_value(cost, "storage_unattributed_distributed"))
                 overhead_props.update(dimensions)
 
-                overhead_txn_id = f"{provider}_{dim_key}_{bucket_date}_overhead"
+                overhead_txn_id = (
+                    f"{self.org_id}_{customer.external_id}_{provider}_{dim_key}_{bucket_date}_overhead"
+                )
                 events.append(
                     Event(
                         transaction_id=overhead_txn_id,

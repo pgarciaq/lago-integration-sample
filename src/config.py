@@ -1,38 +1,176 @@
-"""Configuration via environment variables."""
+"""Configuration loader: YAML mapping file + environment variable interpolation."""
 
-from pydantic import Field
-from pydantic_settings import BaseSettings
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+_ENV_VAR_RE = re.compile(r"\$\{(\w+)(?::([^}]*))?\}")
 
 
-class Settings(BaseSettings):
-    model_config = {"env_prefix": "LAGO_SYNC_"}
+def _interpolate_env(value: str) -> str:
+    """Replace ${VAR} or ${VAR:default} patterns with environment variable values."""
+    def _replace(match):
+        var_name = match.group(1)
+        default = match.group(2)
+        return os.environ.get(var_name, default if default is not None else "")
+    return _ENV_VAR_RE.sub(_replace, value)
 
-    # Koku / Cost Management API
-    koku_base_url: str = Field(default="http://localhost:8000/api/cost-management/v1")
-    koku_identity: str = Field(
-        default="",
-        description="Base64-encoded x-rh-identity header value. Required for cloud; optional if using dev mode.",
+
+def _interpolate_recursive(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return _interpolate_env(obj)
+    if isinstance(obj, dict):
+        return {k: _interpolate_recursive(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_interpolate_recursive(item) for item in obj]
+    return obj
+
+
+@dataclass
+class ResourceFilter:
+    """Defines which Cost Management resources belong to a customer."""
+
+    provider: str
+    filter: dict[str, list[str]] = field(default_factory=dict)
+
+    def matches(self, provider: str, dimensions: dict[str, str]) -> bool:
+        """Check if a cost data leaf with given dimensions matches this filter."""
+        if self.provider != provider:
+            return False
+        for key, patterns in self.filter.items():
+            dim_value = dimensions.get(key, "")
+            if not any(fnmatch.fnmatch(dim_value, pat) for pat in patterns):
+                return False
+        return True
+
+
+@dataclass
+class CustomerConfig:
+    """A billable customer and their associated resources."""
+
+    external_id: str
+    name: str
+    currency: str = "USD"
+    resources: list[ResourceFilter] = field(default_factory=list)
+
+    def matches_leaf(self, provider: str, dimensions: dict[str, str]) -> bool:
+        """Return True if any resource filter matches the given dimensions."""
+        return any(r.matches(provider, dimensions) for r in self.resources)
+
+
+@dataclass
+class CostManagementConfig:
+    base_url: str = "http://localhost:8000/api/cost-management/v1"
+    identity: str = ""
+    org_id: str = ""
+
+
+@dataclass
+class LagoConfig:
+    api_url: str = "http://localhost:3000"
+    api_key: str = ""
+
+
+@dataclass
+class SyncConfig:
+    ocp_include_overhead: bool = True
+
+
+@dataclass
+class AppConfig:
+    """Top-level application configuration."""
+
+    lago: LagoConfig = field(default_factory=LagoConfig)
+    cost_management: CostManagementConfig = field(default_factory=CostManagementConfig)
+    sync: SyncConfig = field(default_factory=SyncConfig)
+    customers: list[CustomerConfig] = field(default_factory=list)
+
+    def providers_needed(self) -> set[str]:
+        """Derive the set of providers needed from customer resource definitions."""
+        providers = set()
+        for customer in self.customers:
+            for resource in customer.resources:
+                providers.add(resource.provider)
+        return providers
+
+    def group_by_for_provider(self, provider: str) -> list[str]:
+        """Derive group_by dimensions needed for a provider from all customer filters."""
+        dimensions: set[str] = set()
+        for customer in self.customers:
+            for resource in customer.resources:
+                if resource.provider == provider:
+                    dimensions.update(resource.filter.keys())
+        return sorted(dimensions) if dimensions else _default_group_by(provider)
+
+    def customers_for_provider(self, provider: str) -> list[CustomerConfig]:
+        """Return customers that have at least one resource filter for this provider."""
+        return [c for c in self.customers if any(r.provider == provider for r in c.resources)]
+
+
+def _default_group_by(provider: str) -> list[str]:
+    defaults = {
+        "aws": ["account", "service", "region"],
+        "azure": ["subscription_guid", "service_name", "resource_location"],
+        "gcp": ["account", "service", "region"],
+        "openshift": ["cluster", "project"],
+    }
+    return defaults.get(provider, [])
+
+
+def load_config(config_path: str | Path | None = None) -> AppConfig:
+    """Load configuration from a YAML file with env var interpolation.
+
+    Falls back to LAGO_SYNC_CONFIG env var, then ./config.yaml.
+    """
+    if config_path is None:
+        config_path = os.environ.get("LAGO_SYNC_CONFIG", "config.yaml")
+
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+
+    raw = yaml.safe_load(path.read_text())
+    data = _interpolate_recursive(raw)
+
+    lago_data = data.get("lago", {})
+    cm_data = data.get("cost_management", {})
+    sync_data = data.get("sync", {})
+    customers_data = data.get("customers", [])
+
+    customers = []
+    for cust in customers_data:
+        resources = []
+        for res in cust.get("resources", []):
+            resources.append(ResourceFilter(
+                provider=res["provider"],
+                filter=res.get("filter", {}),
+            ))
+        customers.append(CustomerConfig(
+            external_id=cust["external_id"],
+            name=cust["name"],
+            currency=cust.get("currency", "USD"),
+            resources=resources,
+        ))
+
+    return AppConfig(
+        lago=LagoConfig(
+            api_url=lago_data.get("api_url", "http://localhost:3000"),
+            api_key=lago_data.get("api_key", ""),
+        ),
+        cost_management=CostManagementConfig(
+            base_url=cm_data.get("base_url", "http://localhost:8000/api/cost-management/v1"),
+            identity=cm_data.get("identity", ""),
+            org_id=cm_data.get("org_id", ""),
+        ),
+        sync=SyncConfig(
+            ocp_include_overhead=sync_data.get("ocp_include_overhead", True),
+        ),
+        customers=customers,
     )
-
-    # Lago API
-    lago_api_key: str = Field(default="")
-    lago_api_url: str = Field(
-        default="http://localhost:3000",
-        description="Lago base URL. Use https://api.getlago.com for Lago Cloud.",
-    )
-
-    # Sync behavior
-    providers: list[str] = Field(default=["aws", "azure", "gcp", "openshift"])
-    aws_group_by: list[str] = Field(default=["account", "service", "region"])
-    azure_group_by: list[str] = Field(default=["subscription_guid", "service_name", "resource_location"])
-    gcp_group_by: list[str] = Field(default=["account", "service", "region"])
-    ocp_group_by: list[str] = Field(default=["cluster", "project"])
-
-    # Org identifier used as Lago external_customer_id
-    org_id: str = Field(default="", description="Koku org_id; becomes the Lago customer external_id")
-
-    # Whether to include distributed overhead as separate line items for OCP
-    ocp_include_overhead: bool = Field(default=True)
-
-
-settings = Settings()
