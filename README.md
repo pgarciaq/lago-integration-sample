@@ -5,19 +5,19 @@ Syncs cost data from **Red Hat Cost Management** (Project Koku) to **Lago** for 
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
+    CM["Cost Management API<br/>/reports/{provider}/costs/"]
+    CM -->|cost data JSON| KOKU
+
     subgraph lago-sync
-        direction TB
         CONFIG[config.yaml] --> KOKU[koku_client]
         KOKU --> SYNC[lago_sync]
         SYNC --> PUSH[Lago SDK]
-        STATE[(state.db)]
+        STATE[(state.db)] -.->|tracks synced dates| SYNC
     end
 
-    CM["Cost Management API<br/>/reports/&#123;provider&#125;/costs/"] -->|cost data JSON| KOKU
     PUSH -->|POST /events/batch| LAGO[Lago API]
     LAGO --> INV[Invoices]
-    STATE -.->|tracks synced dates| SYNC
 ```
 
 ---
