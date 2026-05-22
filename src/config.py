@@ -71,6 +71,7 @@ class CustomerConfig:
     name: str
     currency: str = "USD"
     resources: list[ResourceFilter] = field(default_factory=list)
+    subscription_at: str = ""  # ISO datetime for subscription start (e.g. "2026-05-01T00:00:00Z")
     # Tax-related fields
     email: str = ""
     legal_name: str = ""
@@ -88,6 +89,10 @@ class CostManagementConfig:
     base_url: str = "http://localhost:8000/api/cost-management/v1"
     identity: str = ""
     org_id: str = ""
+    # OAuth2 service account credentials (for SaaS/console.redhat.com)
+    client_id: str = ""
+    client_secret: str = ""
+    token_url: str = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
 
 
 @dataclass
@@ -131,6 +136,7 @@ class AppConfig:
     cost_management: CostManagementConfig = field(default_factory=CostManagementConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     customers: list[CustomerConfig] = field(default_factory=list)
+    state_db_path: str | None = None
 
     def providers_needed(self) -> set[str]:
         """Derive the set of providers needed from customer resource definitions."""
@@ -214,6 +220,19 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
             "  It's used to scope deduplication keys and state tracking."
         )
 
+    has_oauth = cm_data.get("client_id") and cm_data.get("client_secret")
+    has_identity = cm_data.get("identity")
+    if not has_oauth and not has_identity:
+        raise ConfigError(
+            "Cost Management authentication is not configured.\n"
+            "  Provide EITHER:\n"
+            "    - OAuth2: cost_management.client_id + cost_management.client_secret\n"
+            "      (for SaaS / console.redhat.com)\n"
+            "    - Identity: cost_management.identity (base64-encoded x-rh-identity header)\n"
+            "      (for local development)\n"
+            "  See config.example.yaml for examples."
+        )
+
     if not customers_data:
         raise ConfigError(
             "No customers defined in config.yaml.\n"
@@ -284,6 +303,7 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
             name=cust["name"],
             currency=cust.get("currency", "USD"),
             resources=resources,
+            subscription_at=cust.get("subscription_at", ""),
             email=cust.get("email", ""),
             legal_name=cust.get("legal_name", ""),
             tax_identification_number=cust.get("tax_identification_number", ""),
@@ -300,10 +320,14 @@ def load_config(config_path: str | Path | None = None) -> AppConfig:
             base_url=cm_data.get("base_url", "http://localhost:8000/api/cost-management/v1"),
             identity=cm_data.get("identity", ""),
             org_id=cm_data.get("org_id", ""),
+            client_id=cm_data.get("client_id", ""),
+            client_secret=cm_data.get("client_secret", ""),
+            token_url=cm_data.get("token_url", "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"),
         ),
         sync=SyncConfig(
             ocp_include_overhead=sync_data.get("ocp_include_overhead", True),
             invoice_group_by=sync_data.get("invoice_group_by", {}),
         ),
         customers=customers,
+        state_db_path=data.get("state_db_path"),
     )

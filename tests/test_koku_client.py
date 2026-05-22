@@ -60,7 +60,7 @@ def test_fetch_ocp_costs():
 
 @respx.mock
 def test_correct_params_sent():
-    """Test that filter[start_date], filter[end_date], and cost_type are sent."""
+    """Test that start_date, end_date, and cost_type are sent as top-level params."""
     fixture = {"data": [], "meta": {"count": 0}, "links": {}}
 
     route = respx.get("http://localhost:8000/api/cost-management/v1/reports/aws/costs/").mock(
@@ -74,8 +74,8 @@ def test_correct_params_sent():
 
     request = route.calls[0].request
     params = dict(request.url.params)
-    assert params["filter[start_date]"] == "2024-03-01"
-    assert params["filter[end_date]"] == "2024-03-31"
+    assert params["start_date"] == "2024-03-01"
+    assert params["end_date"] == "2024-03-31"
     assert params["filter[resolution]"] == "daily"
     assert params["cost_type"] == "calculated_amortized_cost"
     assert params["group_by[account]"] == "*"

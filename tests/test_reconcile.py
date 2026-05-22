@@ -66,7 +66,7 @@ def test_calculate_customer_totals_ocp():
     fixture = json.loads((FIXTURES / "ocp_costs_response.json").read_text())
     data = fixture["data"]
 
-    totals = _calculate_customer_totals("openshift", data, customers)
+    totals = _calculate_customer_totals("openshift", data, customers, include_overhead=True)
 
-    # my-app cost.total.value = 950.0
-    assert abs(totals["cust_acme"] - 950.0) < 0.01
+    # my-app cost.total.value (950.0) + cost.distributed.value (115.0) = 1065.0
+    assert abs(totals["cust_acme"] - 1065.0) < 0.01

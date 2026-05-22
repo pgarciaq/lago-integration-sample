@@ -23,6 +23,7 @@ lago:
 cost_management:
   base_url: "http://koku:8000/api/cost-management/v1"
   org_id: "org_99"
+  identity: "dGVzdA=="
 
 customers:
   - external_id: "cust_a"
@@ -57,6 +58,7 @@ lago:
 cost_management:
   base_url: "${TEST_KOKU_URL}"
   org_id: "org_1"
+  identity: "dGVzdA=="
 
 customers:
   - external_id: "c1"
@@ -83,6 +85,7 @@ lago:
 
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 
 customers:
   - external_id: "c1"
@@ -103,6 +106,7 @@ lago:
   api_key: "k"
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 customers:
   - external_id: "c1"
     name: "C1"
@@ -128,6 +132,7 @@ lago:
   api_key: "k"
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 customers:
   - external_id: "c1"
     name: "C1"
@@ -221,6 +226,7 @@ lago:
   api_key: "key"
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 customers: []
 """)
     with pytest.raises(ConfigError, match="No customers defined"):
@@ -234,6 +240,7 @@ lago:
   api_key: "key"
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 customers:
   - external_id: "c1"
     name: "C1"
@@ -253,6 +260,7 @@ lago:
   api_key: "key"
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 customers:
   - external_id: "c1"
     name: "C1"
@@ -271,6 +279,7 @@ lago:
   api_key: "key"
 cost_management:
   org_id: "org_1"
+  identity: "dGVzdA=="
 customers:
   - name: "C1"
     resources:
@@ -279,4 +288,23 @@ customers:
           account: ["111"]
 """)
     with pytest.raises(ConfigError, match="external_id.*required"):
+        load_config(cfg)
+
+
+def test_missing_auth_raises_config_error(tmp_path):
+    """Test that missing authentication gives a helpful error."""
+    cfg = _write_config(tmp_path, """
+lago:
+  api_key: "key"
+cost_management:
+  org_id: "org_1"
+customers:
+  - external_id: "c1"
+    name: "C1"
+    resources:
+      - provider: aws
+        filter:
+          account: ["111"]
+""")
+    with pytest.raises(ConfigError, match="authentication is not configured"):
         load_config(cfg)

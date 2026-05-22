@@ -47,6 +47,8 @@ class SyncResult:
     provider: str
     events_sent: int = 0
     events_failed: int = 0
+    events_skipped_zero: int = 0
+    events_corrected: int = 0
     leaves_matched: int = 0
     leaves_unmatched: int = 0
     batches_succeeded: int = 0
@@ -69,6 +71,16 @@ class SyncResult:
             self.batches_succeeded,
             self.batches_succeeded + self.batches_failed,
         )
+        if self.events_skipped_zero > 0:
+            logger.info(
+                "Skipped %d zero-cost events for %s (no billing impact).",
+                self.events_skipped_zero, self.provider,
+            )
+        if self.events_corrected > 0:
+            logger.warning(
+                "%d events for %s had cost changes detected and were corrected.",
+                self.events_corrected, self.provider,
+            )
         if self.leaves_unmatched > 0:
             logger.warning(
                 "%d cost items for %s did not match any customer filter. "
@@ -84,13 +96,15 @@ class SyncResult:
 class LagoSync:
     """Transforms Koku cost data into Lago events routed per customer."""
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, force_resend: bool = False):
         self.config = config
         self.client = Client(
             api_key=config.lago.api_key,
             api_url=config.lago.api_url,
         )
         self.org_id = config.cost_management.org_id
+        self._force_resend = force_resend
+        self._resend_suffix = f"_r{int(datetime.now(tz=timezone.utc).timestamp())}" if force_resend else ""
 
     def sync_provider(
         self,
@@ -98,8 +112,12 @@ class LagoSync:
         data: list[dict[str, Any]],
         customers: list[CustomerConfig],
         dry_run: bool = False,
+        state: Any = None,
     ) -> SyncResult:
         """Convert Koku report data into Lago events routed to appropriate customers.
+
+        If `state` (SyncState) is provided, detects and corrects events whose
+        cost values have changed since the last sync (Cost Management reprocessing).
 
         Returns a SyncResult with detailed statistics.
         """
@@ -120,10 +138,76 @@ class LagoSync:
             if len(events) > 5:
                 logger.info("  [DRY RUN] ... and %d more events", len(events) - 5)
         else:
-            self._push_events(events, result)
+            if state and not self._force_resend:
+                event_records = [
+                    (e.transaction_id, e.properties.get("cost_amount", "0"), e.properties)
+                    for e in events
+                ]
+                self._correct_changed_events(events, event_records, result, state)
+            self._push_events(events, result, state)
 
         result.log_summary()
         return result
+
+    def _correct_changed_events(self, events: list[Event], event_records: list[tuple[str, str, dict]], result: SyncResult, state: Any):
+        """Detect events whose costs changed and inject correction (delta) events.
+
+        Instead of deprecating the old event (which risks data loss if the new push
+        fails), we push an additive correction event with the delta:
+            correction_amount = new_cost - old_cost
+
+        This ensures:
+        - If correction succeeds: invoice total = old + delta = new (correct)
+        - If correction fails: invoice total = old (slightly wrong, but not missing)
+        - Original billing data is NEVER destroyed
+        """
+        changed = state.find_changed_events(event_records)
+        if not changed:
+            return
+
+        logger.warning(
+            "Detected %d events with changed costs (Cost Management reprocessed data). "
+            "Pushing correction (delta) events.",
+            len(changed),
+        )
+
+        correction_ts = int(datetime.now(tz=timezone.utc).timestamp())
+
+        for txn_id, old_cost, new_cost in changed:
+            try:
+                delta = float(new_cost) - float(old_cost)
+            except (ValueError, TypeError):
+                continue
+
+            if abs(delta) < 0.001:
+                continue
+
+            correction_txn_id = f"{txn_id}_correction_{correction_ts}"
+            original_event = next((e for e in events if e.transaction_id == txn_id), None)
+            if not original_event:
+                continue
+
+            correction_event = Event(
+                transaction_id=correction_txn_id,
+                external_subscription_id=original_event.external_subscription_id,
+                code=original_event.code,
+                timestamp=original_event.timestamp,
+                properties={
+                    **original_event.properties,
+                    "cost_amount": str(delta),
+                    "_correction": "true",
+                    "_original_txn_id": txn_id,
+                    "_old_cost": old_cost,
+                    "_new_cost": new_cost,
+                },
+            )
+            events.append(correction_event)
+            result.events_corrected += 1
+
+            logger.info(
+                "Correction event for %s: delta=%+.4f (was $%s, now $%s)",
+                txn_id[:50], delta, old_cost, new_cost,
+            )
 
     def _extract_events(
         self,
@@ -186,6 +270,21 @@ class LagoSync:
                     self._walk_tree(child, provider, bucket_date, child_dims, customers, events, result)
                 return
 
+        # Handle tag-grouped responses: keys like "tag:team" containing lists of children
+        for key in list(node.keys()):
+            if key.startswith("tag:") and isinstance(node[key], list):
+                for child in node[key]:
+                    child_dims = {**dimensions}
+                    if isinstance(child, dict):
+                        tag_val = child.get(key, "")
+                        if tag_val:
+                            child_dims[key] = str(tag_val)
+                        for k, v in child.items():
+                            if k.startswith("tag:") and isinstance(v, str) and k != key:
+                                child_dims[k] = v
+                        self._walk_tree(child, provider, bucket_date, child_dims, customers, events, result)
+                return
+
     def _route_leaf(
         self,
         leaf: dict[str, Any],
@@ -200,15 +299,32 @@ class LagoSync:
         matched = False
         for customer in customers:
             if customer.matches_leaf(provider, dimensions):
+                self._check_currency(leaf, customer, result)
                 matched = True
                 events.extend(
-                    self._leaf_to_events(leaf, provider, bucket_date, dimensions, customer)
+                    self._leaf_to_events(leaf, provider, bucket_date, dimensions, customer, result)
                 )
 
         if matched:
             result.leaves_matched += 1
         else:
             result.leaves_unmatched += 1
+
+    def _check_currency(self, leaf: dict[str, Any], customer: CustomerConfig, result: SyncResult):
+        """Validate that Cost Management's currency matches the customer's Lago currency."""
+        cost = leaf.get("cost", {})
+        total_field = cost.get("total", {})
+        if isinstance(total_field, dict):
+            source_currency = total_field.get("units", "")
+            if source_currency and source_currency.upper() != customer.currency.upper():
+                msg = (
+                    f"Currency mismatch for customer '{customer.external_id}': "
+                    f"Cost Management reports {source_currency} but customer is configured "
+                    f"as {customer.currency}. Amounts will be incorrect on the invoice."
+                )
+                if msg not in result.errors:
+                    result.errors.append(msg)
+                    logger.error(msg)
 
     def _leaf_to_events(
         self,
@@ -217,6 +333,7 @@ class LagoSync:
         bucket_date: str,
         dimensions: dict[str, str],
         customer: CustomerConfig,
+        result: SyncResult,
     ) -> list[Event]:
         """Convert a single leaf cost object into one or two Lago Events for a customer."""
         events: list[Event] = []
@@ -224,10 +341,14 @@ class LagoSync:
         metric_code = PROVIDER_METRIC_CODE[provider]
         subscription_id = f"{customer.external_id}_{provider}"
 
-        dim_key = "_".join(str(v) for v in sorted(dimensions.values())) if dimensions else "total"
+        dim_key = self._stable_dim_key(dimensions)
 
         cost = leaf.get("cost", {})
         cost_total = self._extract_value(cost, "total")
+
+        if abs(cost_total) < 0.001:
+            result.events_skipped_zero += 1
+            return events
 
         properties: dict[str, str] = {"cost_amount": str(cost_total)}
         properties["cost_raw"] = str(self._extract_value(cost, "raw"))
@@ -235,7 +356,7 @@ class LagoSync:
         properties["cost_usage"] = str(self._extract_value(cost, "usage"))
         properties.update(dimensions)
 
-        txn_id = f"{self.org_id}_{customer.external_id}_{provider}_{dim_key}_{bucket_date}_direct"
+        txn_id = f"{self.org_id}_{customer.external_id}_{provider}_{dim_key}_{bucket_date}_direct{self._resend_suffix}"
         events.append(
             Event(
                 transaction_id=txn_id,
@@ -248,7 +369,7 @@ class LagoSync:
 
         if provider == "openshift" and self.config.sync.ocp_include_overhead:
             distributed = self._extract_value(cost, "distributed")
-            if distributed and distributed > 0:
+            if distributed and abs(distributed) >= 0.001:
                 overhead_props: dict[str, str] = {"cost_amount": str(distributed)}
                 overhead_props["platform"] = str(self._extract_value(cost, "platform_distributed"))
                 overhead_props["worker"] = str(self._extract_value(cost, "worker_unallocated_distributed"))
@@ -257,7 +378,7 @@ class LagoSync:
                 overhead_props.update(dimensions)
 
                 overhead_txn_id = (
-                    f"{self.org_id}_{customer.external_id}_{provider}_{dim_key}_{bucket_date}_overhead"
+                    f"{self.org_id}_{customer.external_id}_{provider}_{dim_key}_{bucket_date}_overhead{self._resend_suffix}"
                 )
                 events.append(
                     Event(
@@ -271,29 +392,122 @@ class LagoSync:
 
         return events
 
-    def _push_events(self, events: list[Event], result: SyncResult):
-        """Send events to Lago in batches, continuing on partial failures."""
+    def _push_events(self, events: list[Event], result: SyncResult, state: Any = None):
+        """Send events to Lago in batches, continuing on partial failures.
+
+        Handles Lago's batch semantics: if a batch is rejected due to duplicate
+        transaction_ids, those events already exist — this is treated as success
+        (idempotent retry). Only non-duplicate errors are reported as failures.
+
+        Streams cost records to state DB after each successful batch to keep
+        memory usage flat for large syncs.
+        """
         for i in range(0, len(events), BATCH_SIZE):
             batch = events[i : i + BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            batch_succeeded = False
             try:
                 self._send_batch(batch)
                 result.events_sent += len(batch)
                 result.batches_succeeded += 1
+                batch_succeeded = True
             except Exception as e:
-                result.events_failed += len(batch)
-                result.batches_failed += 1
-                result.errors.append(f"Batch {i // BATCH_SIZE + 1}: {e}")
-                logger.error(
-                    "Batch %d failed (%d events lost): %s. Continuing with next batch.",
-                    i // BATCH_SIZE + 1,
-                    len(batch),
-                    e,
-                )
+                error_details = self._parse_batch_error(e)
+                if error_details is not None:
+                    dupes, real_failures = error_details
+                    if real_failures == 0:
+                        result.events_sent += len(batch)
+                        result.batches_succeeded += 1
+                        batch_succeeded = True
+                        logger.debug(
+                            "Batch %d: all %d events already exist (idempotent).",
+                            batch_num, dupes,
+                        )
+                    else:
+                        result.events_failed += real_failures
+                        result.events_sent += dupes
+                        result.batches_failed += 1
+                        result.errors.append(
+                            f"Batch {batch_num}: {real_failures} real failures, {dupes} duplicates (OK)"
+                        )
+                        logger.warning(
+                            "Batch %d: %d events failed (%d were duplicates, already billed). "
+                            "Continuing with next batch.",
+                            batch_num, real_failures, dupes,
+                        )
+                else:
+                    result.events_failed += len(batch)
+                    result.batches_failed += 1
+                    result.errors.append(f"Batch {batch_num}: {e}")
+                    logger.error(
+                        "Batch %d failed (%d events): %s. Continuing with next batch.",
+                        batch_num, len(batch), e,
+                    )
+
+            if batch_succeeded and state:
+                batch_records = [
+                    (e.transaction_id, e.properties.get("cost_amount", "0"), e.properties)
+                    for e in batch
+                ]
+                state.store_event_costs_batch(batch_records)
+
+    @staticmethod
+    def _parse_batch_error(error: Exception) -> tuple[int, int] | None:
+        """Parse a Lago batch 422 error to distinguish duplicates from real failures.
+
+        Returns (duplicate_count, real_failure_count) or None if the error
+        isn't a parseable batch validation error.
+        """
+        error_data = None
+        if hasattr(error, "response") and isinstance(error.response, dict):
+            error_data = error.response
+        else:
+            error_str = str(error)
+            if "value_already_exist" not in error_str:
+                return None
+            try:
+                import json
+                import ast
+                try:
+                    error_data = json.loads(error_str)
+                except (json.JSONDecodeError, ValueError):
+                    error_data = ast.literal_eval(error_str)
+            except (ValueError, SyntaxError):
+                return None
+
+        if not error_data or not isinstance(error_data, dict):
+            return None
+
+        details = error_data.get("error_details", {})
+        if not details:
+            return None
+
+        dupes = 0
+        real_failures = 0
+        for _idx, errs in details.items():
+            if isinstance(errs, dict) and errs.get("transaction_id") == ["value_already_exist"]:
+                dupes += 1
+            else:
+                real_failures += 1
+        return (dupes, real_failures)
 
     @with_retry
     def _send_batch(self, batch: list[Event]):
         """Send a single batch to Lago with retry on transient errors."""
         self.client.events.batch_create(BatchEvent(events=batch))
+
+    @staticmethod
+    def _stable_dim_key(dimensions: dict[str, str]) -> str:
+        """Create a stable, normalized key from dimension values.
+
+        Strips whitespace to prevent transaction_id instability from trailing
+        spaces. Case is preserved to maintain backward compatibility with
+        existing events in Lago.
+        """
+        if not dimensions:
+            return "total"
+        normalized = sorted(str(v).strip() for v in dimensions.values())
+        return "_".join(normalized)
 
     @staticmethod
     def _extract_value(cost_obj: dict[str, Any], key: str) -> float:

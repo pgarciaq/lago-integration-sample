@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date
 from typing import Any
 
@@ -30,18 +31,45 @@ class KokuClient:
 
     def __init__(self, config: AppConfig):
         self.base_url = config.cost_management.base_url.rstrip("/")
-        self.identity = config.cost_management.identity
+        self._cm_config = config.cost_management
+        self._token: str | None = None
+        self._token_expires_at: float = 0
         self._client = httpx.Client(
             base_url=self.base_url,
-            headers=self._build_headers(),
+            headers={"Accept": "application/json"},
             timeout=60.0,
         )
 
-    def _build_headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if self.identity:
-            headers["x-rh-identity"] = self.identity
-        return headers
+    def _get_auth_headers(self) -> dict[str, str]:
+        """Get authentication headers, refreshing OAuth2 token if needed."""
+        if self._cm_config.client_id and self._cm_config.client_secret:
+            return {"Authorization": f"Bearer {self._get_oauth_token()}"}
+        elif self._cm_config.identity:
+            return {"x-rh-identity": self._cm_config.identity}
+        return {}
+
+    def _get_oauth_token(self) -> str:
+        """Get a valid OAuth2 token, refreshing if expired."""
+        if self._token and time.time() < self._token_expires_at - 30:
+            return self._token
+
+        logger.debug("Refreshing OAuth2 token from %s", self._cm_config.token_url)
+        resp = httpx.post(
+            self._cm_config.token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self._cm_config.client_id,
+                "client_secret": self._cm_config.client_secret,
+                "scope": "api.console",
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        token_data = resp.json()
+        self._token = token_data["access_token"]
+        self._token_expires_at = time.time() + token_data.get("expires_in", 900)
+        logger.info("OAuth2 token acquired (expires in %ds)", token_data.get("expires_in", 900))
+        return self._token
 
     def fetch_costs(
         self,
@@ -83,6 +111,7 @@ class KokuClient:
     @with_retry
     def _fetch_page(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         """Fetch a single page from the API, with retry on transient errors."""
+        self._client.headers.update(self._get_auth_headers())
         resp = self._client.get(path, params=params)
         resp.raise_for_status()
         return resp.json()
@@ -92,8 +121,8 @@ class KokuClient:
     ) -> dict[str, str]:
         params: dict[str, str] = {
             "filter[resolution]": "daily",
-            "filter[start_date]": start_date.isoformat(),
-            "filter[end_date]": end_date.isoformat(),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
         }
         if provider in PROVIDER_COST_TYPE:
             params["cost_type"] = PROVIDER_COST_TYPE[provider]

@@ -46,7 +46,10 @@ def reconcile_month(config: AppConfig, month: str) -> list[dict[str, Any]]:
             continue
 
         # Calculate per-customer totals from Cost Management data
-        cm_customer_totals = _calculate_customer_totals(provider, data, customers)
+        cm_customer_totals = _calculate_customer_totals(
+            provider, data, customers,
+            include_overhead=(provider == "openshift" and config.sync.ocp_include_overhead),
+        )
 
         # Get Lago usage per customer for comparison
         lago_customer_totals = _get_lago_usage(lago_client, customers, provider, month)
@@ -170,9 +173,14 @@ def _find_period_amount(usage_response: Any, month: str) -> float:
 
 
 def _calculate_customer_totals(
-    provider: str, data: list[dict[str, Any]], customers: list[CustomerConfig]
+    provider: str, data: list[dict[str, Any]], customers: list[CustomerConfig],
+    include_overhead: bool = True,
 ) -> dict[str, float]:
-    """Walk the response tree and accumulate cost totals per customer."""
+    """Walk the response tree and accumulate cost totals per customer.
+
+    For OpenShift, includes both cost.total (direct) and cost.distributed (overhead)
+    when include_overhead=True, matching what the sync pushes to Lago.
+    """
     from src.lago_sync import DIMENSION_PLURAL_KEYS, LagoSync
 
     totals: dict[str, float] = {c.external_id: 0.0 for c in customers}
@@ -192,10 +200,15 @@ def _calculate_customer_totals(
 
                 cost = leaf.get("cost", {})
                 cost_total = LagoSync._extract_value(cost, "total")
+                leaf_total = cost_total
+
+                if provider == "openshift" and include_overhead:
+                    distributed = LagoSync._extract_value(cost, "distributed")
+                    leaf_total += distributed
 
                 for customer in customers:
                     if customer.matches_leaf(provider, leaf_dims):
-                        totals[customer.external_id] += cost_total
+                        totals[customer.external_id] += leaf_total
             return
 
         for singular, plural in DIMENSION_PLURAL_KEYS.items():
@@ -208,6 +221,21 @@ def _calculate_customer_totals(
                         if key.startswith("tag:") and isinstance(val, str):
                             child_dims[key] = val
                     _walk(child, child_dims)
+                return
+
+        # Handle tag-grouped responses
+        for key in list(node.keys()):
+            if key.startswith("tag:") and isinstance(node[key], list):
+                for child in node[key]:
+                    child_dims = {**dims}
+                    if isinstance(child, dict):
+                        tag_val = child.get(key, "")
+                        if tag_val:
+                            child_dims[key] = str(tag_val)
+                        for k, v in child.items():
+                            if k.startswith("tag:") and isinstance(v, str) and k != key:
+                                child_dims[k] = v
+                        _walk(child, child_dims)
                 return
 
     for time_bucket in data:

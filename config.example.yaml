@@ -6,10 +6,22 @@ lago:
   api_key: "${LAGO_API_KEY}"
 
 cost_management:
-  base_url: "${KOKU_BASE_URL:http://localhost:8000/api/cost-management/v1}"
-  # Base64-encoded x-rh-identity header. Leave empty for local dev mode.
+  base_url: "${KOKU_BASE_URL:https://console.redhat.com/api/cost-management/v1}"
+  # Authentication (choose one):
+  # Option A: OAuth2 service account (for SaaS / console.redhat.com)
+  client_id: "${COSTMGMT_CLIENT_ID:}"
+  client_secret: "${COSTMGMT_CLIENT_SECRET:}"
+  token_url: "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+  # Option B: x-rh-identity header (for local dev mode)
   identity: "${KOKU_IDENTITY:}"
   org_id: "org_12345"
+
+# ─── State database ───────────────────────────────────────────────
+# Path to the SQLite state database. Tracks what has been synced and stores
+# event cost fingerprints for change detection.
+# Default: ~/.lago-sync/state.db
+# Override via LAGO_SYNC_STATE_DB env var or this config key.
+# state_db_path: "/var/lib/lago-sync/state.db"
 
 sync:
   # Generate separate overhead line items for OpenShift distributed costs
@@ -18,6 +30,7 @@ sync:
   # Invoice itemization: which dimensions produce separate line items on the Lago invoice.
   # Each key below is a provider, and the value is the list of event properties to group by.
   # If omitted, defaults are used (shown below). Set to [] for a single totaled line item.
+  # After changing, run: lago-sync bootstrap --update
   invoice_group_by:
     aws: ["account", "service"]
     azure: ["subscription_guid", "service_name"]
@@ -31,6 +44,10 @@ customers:
   - external_id: "customer_acme"
     name: "Acme Corp"
     currency: "USD"
+    # When does billing start? Events before this date are silently ignored by Lago.
+    # Set to the 1st of the month you want to start billing from.
+    # If omitted, defaults to the time bootstrap runs (fine for going-forward billing).
+    subscription_at: "2026-01-01T00:00:00Z"
     # Tax-relevant fields (optional but recommended for tax compliance)
     email: "billing@acme.example.com"
     legal_name: "Acme Corporation Inc."

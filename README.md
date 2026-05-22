@@ -64,6 +64,16 @@ Creates billable metrics, plan, charges, customers, and subscriptions in Lago:
 lago-sync bootstrap
 ```
 
+To update existing charges when configuration changes (e.g., `invoice_group_by` was modified):
+
+```bash
+lago-sync bootstrap --update
+```
+
+> **Warning:** `--update` deletes and recreates charges on the Lago plan. This is safe
+> before the first billing cycle but may affect in-flight subscriptions. Use with caution
+> on production systems.
+
 ### 4. Sync cost data
 
 ```bash
@@ -76,11 +86,32 @@ lago-sync sync
 # Preview what would be sent without pushing (USE THIS FIRST)
 lago-sync sync --month 2024-01 --dry-run
 
-# Force re-sync of previously synced data
+# Force re-sync of previously synced data (idempotent — same transaction IDs)
 lago-sync sync --month 2024-01 --force
+
+# Force resend with NEW transaction IDs (CAUTION: creates duplicate charges!)
+lago-sync sync --month 2024-01 --force-resend
 ```
 
-### 5. Reconcile
+#### `--force` vs `--force-resend`
+
+| Flag | Bypasses local state? | New transaction IDs? | Safe to re-run? | Use case |
+|------|----------------------|---------------------|-----------------|----------|
+| (neither) | No | No | Yes | Normal daily sync |
+| `--force` | Yes | No | Yes | Re-sync after local state DB was lost or reset |
+| `--force-resend` | Yes | Yes | **NO** — creates duplicates | After recreating subscriptions or resetting billing periods in Lago |
+
+**When to use `--force-resend`**: Only after you've deleted/recreated a subscription in Lago (which clears its event history), or after manually voiding invoices and needing to re-push all data with fresh IDs. It appends a timestamp suffix to all transaction IDs, making them unique.
+
+### 5. Validate (run before first sync)
+
+Check that both APIs are reachable, credentials work, and Lago entities exist:
+
+```bash
+lago-sync validate
+```
+
+### 6. Reconcile
 
 Compare Cost Management totals against Lago's recorded usage:
 
@@ -103,7 +134,16 @@ Before this integration can do anything, Cost Management must have **processed a
 3. Koku (Cost Management backend) downloads, converts to Parquet, runs through Trino/PostgreSQL summarization pipeline
 4. Summarized data becomes available via the REST API
 
-**Important**: Data appears in the API 24-48 hours after the usage date. End-of-month data may continue reprocessing for 2-3 days into the next month as cloud providers finalize bills.
+**Data freshness by provider:**
+
+| Provider | Update frequency | Typical sync strategy |
+|----------|-----------------|----------------------|
+| OpenShift | Every 1 hour (operator upload cycle) | Can sync same-day data |
+| AWS | Once per day (CUR refresh) | Sync T-1 (yesterday) |
+| Azure | Once per day (export refresh) | Sync T-1 (yesterday) |
+| GCP | Once per day (BigQuery export) | Sync T-1 (yesterday) |
+
+Cost Management processes data immediately upon receipt. The limiting factor is how often each data source publishes new data. End-of-month cloud data may continue updating for 1-2 days as hyperscalers finalize bills (Reserved Instance adjustments, Savings Plan true-ups).
 
 ### Phase 2: lago-sync fetches and routes
 
@@ -141,9 +181,16 @@ lago:
 
 # ─── Cost Management connection ────────────────────────────────────
 cost_management:
-  base_url: "http://localhost:8000/api/cost-management/v1"
-  identity: "${KOKU_IDENTITY}"          # base64-encoded x-rh-identity header
+  base_url: "https://console.redhat.com/api/cost-management/v1"
   org_id: "my-org"                      # Unique org identifier for state tracking
+
+  # Authentication (choose one — at least one is required):
+  # Option A: OAuth2 service account (for SaaS / console.redhat.com)
+  client_id: "${COSTMGMT_CLIENT_ID}"
+  client_secret: "${COSTMGMT_CLIENT_SECRET}"
+  token_url: "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
+  # Option B: x-rh-identity header (for local development)
+  identity: "${KOKU_IDENTITY:}"         # base64-encoded x-rh-identity header
 
 # ─── Sync behavior ────────────────────────────────────────────────
 sync:
@@ -162,6 +209,7 @@ customers:
   - external_id: "customer_acme"        # Becomes the Lago customer ID
     name: "Acme Corp"                   # Display name on invoices
     currency: "USD"                     # ISO 4217 currency code
+    subscription_at: "2026-01-01T00:00:00Z"  # When billing starts (events before this are ignored!)
     resources:                          # What this customer is billed for:
       - provider: aws
         filter:
@@ -209,8 +257,11 @@ lago:
 | `openshift`| `cluster`              | `["prod-cluster-01"]`                         |
 | `openshift`| `project`              | `["team-a-*", "shared-services"]`             |
 | `openshift`| `node`                 | `["worker-*"]`                                |
+| Any        | `tag:<key>`            | `["value1", "value*"]` (tag-based grouping)   |
 
 **Glob patterns**: Filter values support `*` (any characters) and `?` (single character) matching via Python's `fnmatch`. This lets you match namespaces like `team-a-*` without listing every project.
+
+**Tag-based filtering**: Any provider supports filtering by Cost Management tags using the `tag:<key>` syntax. Example: `"tag:team": ["engineering"]` matches resources tagged with `team=engineering`.
 
 ---
 
@@ -286,9 +337,19 @@ For AWS, this integration requests `cost_type=calculated_amortized_cost`. This m
 - Savings Plan discounts are amortized
 - You get the "true economic cost" rather than the cash-flow timing of payments
 
-### The `x-rh-identity` header
+### Authentication
 
-Cost Management uses a base64-encoded JSON header for authentication:
+The integration supports two authentication methods:
+
+**OAuth2 service account (recommended for production / SaaS):**
+
+Used with `console.redhat.com`. Configure `client_id`, `client_secret`, and `token_url` in `config.yaml`. The integration automatically obtains and refreshes access tokens using the OAuth2 client credentials flow.
+
+To create a service account: Red Hat Hybrid Cloud Console → Settings → Integrations → Service Accounts.
+
+**`x-rh-identity` header (for local development only):**
+
+Cost Management uses a base64-encoded JSON header for development authentication:
 
 ```json
 {
@@ -306,7 +367,7 @@ Cost Management uses a base64-encoded JSON header for authentication:
 
 Encode it: `echo '{"identity": {...}}' | base64 -w0`
 
-In production (console.redhat.com), this is provided by the platform's authentication layer. For local development, the Koku `DEVELOPMENT=True` mode accepts any well-formed identity.
+This only works with Koku's `DEVELOPMENT=True` mode. In production, use OAuth2 instead.
 
 ---
 
@@ -392,7 +453,29 @@ sync:
     gcp: []
 ```
 
-If you change `invoice_group_by`, you must re-run `lago-sync bootstrap` to update the charges in Lago. Existing charges from a previous bootstrap will need to be deleted first (in the Lago UI or via API), since the charge endpoint returns 422 for duplicates.
+If you change `invoice_group_by`, re-run `lago-sync bootstrap --update` to update the charges in Lago. This deletes and recreates charges with the new `pricing_group_keys`.
+
+### Subscription start date (`subscription_at`)
+
+**Critical**: Lago silently ignores events whose timestamp is before the subscription's start date. If you're backfilling historical data, you **must** set `subscription_at` in your customer config to a date before your earliest sync date:
+
+```yaml
+customers:
+  - external_id: "customer_acme"
+    name: "Acme Corp"
+    subscription_at: "2026-01-01T00:00:00Z"  # Bill from January onwards
+    resources:
+      - provider: openshift
+        filter:
+          project: ["acme-*"]
+```
+
+If omitted, the subscription starts at the time `lago-sync bootstrap` is run. This is fine for going-forward billing but will miss historical data.
+
+**Symptoms of a misconfigured start date:**
+- Events are accepted by Lago (200 OK) but `current_usage` shows $0
+- No errors in the sync log — events are silently ignored
+- Fix: Terminate and recreate the subscription with the correct `subscription_at`, then `--force-resend`
 
 ### Deduplication via `transaction_id`
 
@@ -410,6 +493,59 @@ If you re-push the same data, Lago deduplicates by `transaction_id`. This means:
 ### Multi-currency
 
 Each customer can have a different currency (set in `config.yaml`). Lago handles currency at the customer level. The amounts from Cost Management are always in USD; if a customer uses EUR, you should configure exchange rates in Lago or handle conversion externally.
+
+---
+
+## What the Invoice Looks Like
+
+Here's a real invoice generated by Lago from OpenShift cost data synced by this integration (May 2026, 353 events across 3 days):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  INVOICE PCO-202605-003                                   May 22, 2026      │
+│  Customer: E2E Test Customer                              Currency: USD      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  OCP Daily Cost                                                             │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  project=Worker unallocated ............................ $    1,316.63       │
+│  project=analytics .................................... $      607.43       │
+│  project=cost-management .............................. $      607.13       │
+│  project=Platform unallocated ......................... $      530.69       │
+│  project=fall ......................................... $      299.08       │
+│  project=snowdown ..................................... $      299.08       │
+│  project=openshift .................................... $      258.36       │
+│  project=kube-system .................................. $      258.30       │
+│  project=openshift-kube-apiserver ..................... $      210.40       │
+│  project=catalog ...................................... $      199.62       │
+│  ... (82 more line items)                                                   │
+│                                                     Subtotal: $  5,513.27   │
+│                                                                             │
+│  OCP Daily Overhead                                                         │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  project=analytics .................................... $      970.47       │
+│  project=cost-management .............................. $      800.11       │
+│  project=netobserv .................................... $      466.66       │
+│  project=fall ......................................... $      452.36       │
+│  project=snowdown ..................................... $      452.36       │
+│  project=netobserv-privileged ......................... $      402.24       │
+│  project=weather ...................................... $      293.09       │
+│  project=sunshine ..................................... $      291.65       │
+│  ... (30 more line items)                                                   │
+│                                                     Subtotal: $  5,513.24   │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                         Tax:  $      0.00   │
+│                                                     ─────────────────────   │
+│                                                     TOTAL:    $ 11,026.51   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Each project becomes a separate line item on the invoice because `pricing_group_keys` is set to `["project"]`. This level of granularity lets customers see exactly which namespaces drive costs.
+
+> **Example files** (in `docs/`):
+> - `example-invoice.pdf` — Real 8-page PDF invoice generated by Lago
+> - `example-billing-report.xlsx` — Excel report with usage summary, event detail, and reconciliation
 
 ---
 
@@ -585,19 +721,25 @@ All fields are optional. If omitted, the billing entity's default tax applies.
 
 ### Scheduling
 
-**Daily sync (cron):**
+**Daily sync (cron) — cloud providers:**
 ```bash
-# Sync yesterday's data at 6 AM (give CM time to process)
+# Sync yesterday's data at 6 AM (cloud providers refresh once per day)
 0 6 * * * cd /path/to/lago-integration-sample && lago-sync sync 2>&1 >> /var/log/lago-sync.log
+```
+
+**Frequent sync — OpenShift (optional):**
+```bash
+# OpenShift data can be as fresh as 1 hour; sync today's partial data every 2 hours
+0 */2 * * * cd /path/to/lago-integration-sample && lago-sync sync --start-date $(date +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --force 2>&1 >> /var/log/lago-sync.log
 ```
 
 **Monthly full sync (for finalization):**
 ```bash
-# On the 3rd of each month, sync the previous month completely
-0 8 3 * * cd /path/to/lago-integration-sample && lago-sync sync --month $(date -d "last month" +\%Y-\%m) --force 2>&1 >> /var/log/lago-sync.log
+# On the 2nd of each month, sync the previous month completely
+0 8 2 * * cd /path/to/lago-integration-sample && lago-sync sync --month $(date -d "last month" +\%Y-\%m) --force 2>&1 >> /var/log/lago-sync.log
 ```
 
-**Why the 3rd?** Cloud providers (especially AWS) may finalize CUR data 1-2 days into the next month. Running on the 3rd gives you more complete data.
+**Why the 2nd?** Cloud providers (especially AWS) may finalize CUR data 1 day into the next month. Running on the 2nd gives complete data while still being timely for invoice generation.
 
 **systemd timer:**
 ```ini
@@ -613,17 +755,88 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-### State database
+### Exit codes
 
-Sync state is stored in `~/.lago-sync/state.db` (SQLite). To inspect:
+The `sync` command exits with a non-zero code on failure, making it compatible with cron, systemd, and CI/CD pipelines:
 
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Success — all events pushed (or dry-run complete) |
+| `1` | Partial or total failure — some events failed to push |
+
+Use this in scripts to trigger alerts:
 ```bash
-sqlite3 ~/.lago-sync/state.db "SELECT * FROM sync_log ORDER BY sync_date DESC LIMIT 20;"
+lago-sync sync --month 2024-01 || alert "lago-sync failed with exit code $?"
 ```
 
-To reset state (forces full re-sync):
+### State database
+
+Sync state is stored in `~/.lago-sync/state.db` (SQLite). It contains:
+- **`sync_log`**: Which (customer, provider, date) combinations have been synced
+- **`event_costs`**: Cost fingerprints for each event (used to detect when Cost Management reprocesses data)
+
+**Custom location** (for containers, shared storage, etc.):
+```yaml
+# In config.yaml:
+state_db_path: "/var/lib/lago-sync/state.db"
+```
+Or via environment variable: `LAGO_SYNC_STATE_DB=/var/lib/lago-sync/state.db`
+
+**Inspect:**
+```bash
+sqlite3 ~/.lago-sync/state.db "SELECT * FROM sync_log ORDER BY sync_date DESC LIMIT 20;"
+sqlite3 ~/.lago-sync/state.db "SELECT COUNT(*) FROM event_costs;"
+```
+
+**Reset** (forces full re-sync):
 ```bash
 rm ~/.lago-sync/state.db
+```
+
+### Cost correction detection
+
+When Cost Management reprocesses data (e.g., AWS finalizes RI charges, cost models are updated), cost values can change for previously-synced dates. The integration detects this and pushes correction (delta) events:
+
+1. On each sync, event cost fingerprints are stored in `state.db`
+2. On re-sync (with `--force`), new values are compared against stored fingerprints
+3. If a value changed: a **correction event** is pushed with the delta (new - old)
+4. Lago sums the original + correction under the same invoice line item
+
+**Why a delta, not a replacement?** Lago doesn't support updating existing events. The delta approach ensures that if the correction event fails to push (network issue), the original billing data is still intact — slightly wrong, but never missing.
+
+**How it appears in logs:**
+```
+WARNING: Detected 3 events with changed costs (Cost Management reprocessed data).
+         Pushing correction (delta) events.
+INFO: Correction event for org_acme_openshift_frontend_2024-01-15_direct: delta=+15.50 (was $420.00, now $435.50)
+```
+
+**IMPORTANT: Corrections only trigger on `--force` re-syncs.** Without `--force`, the state check skips already-synced dates. This means:
+- **Daily cron (no `--force`)**: Syncs new data only. Cost corrections are NOT detected.
+- **Monthly full sync (`--force`)**: Detects and corrects any reprocessed data.
+
+This is why the recommended schedule includes **both** a daily sync and a monthly `--force` sync:
+
+```bash
+# Daily: sync yesterday (new data only, no correction detection)
+0 6 * * * lago-sync sync
+
+# Monthly: re-sync entire previous month with correction detection
+0 8 2 * * lago-sync sync --month $(date -d "last month" +\%Y-\%m) --force
+```
+
+The monthly `--force` sync catches any data that was reprocessed after the daily sync originally ran.
+
+### Zero-cost event filtering
+
+Events with `cost_amount < $0.001` are automatically skipped. These typically represent:
+- Namespaces with no actual resource usage
+- Services with $0 free-tier usage
+- Placeholder items in Cost Management
+
+This reduces Lago event volume without affecting billing accuracy. The count of skipped events is logged:
+```
+INFO: Skipped 5 zero-cost events for openshift (no billing impact).
 ```
 
 ### Reconciliation workflow
@@ -637,20 +850,23 @@ $ lago-sync reconcile --month 2024-01
   Reconciliation Report: 2024-01
 ======================================================================
 
-  [     OK] customer_acme                  | aws        | $     4,523.17
-  [     OK] customer_acme                  | openshift  | $     1,205.44
-  [     OK] customer_globex                | aws        | $     8,901.22
-  [WARNING] __unmatched__                  | aws        | $       342.55
-            $342.55 in costs not matched to any customer filter
+  [      OK] customer_acme                  | aws        | CM: $   4,523.17 | Lago: $   4,523.17
+  [      OK] customer_acme                  | openshift  | CM: $   1,205.44 | Lago: $   1,205.44
+  [      OK] customer_globex                | aws        | CM: $   8,901.22 | Lago: $   8,901.22
+  [MISMATCH] customer_initech               | openshift  | CM: $     890.00 | Lago: $     875.50
+               Delta: $-14.50 (Lago has less than Cost Management)
+  [ WARNING] __unmatched__                  | aws        | CM: $     342.55 | Lago:          N/A
+               $342.55 in costs not matched to any customer filter
 
 ======================================================================
 ```
 
 **What the statuses mean:**
 - `OK` — Cost Management and Lago totals match within $0.01
-- `MISMATCH` — Totals differ (investigate before finalizing)
-- `WARNING` — Costs exist that no customer filter matches
+- `MISMATCH` — Totals differ (investigate before finalizing the invoice)
+- `WARNING` — Costs exist that no customer filter matches (unbilled)
 - `NO DATA` — No cost data in Cost Management for this period
+- `LAGO N/A` — Could not retrieve Lago usage (check connectivity/API key)
 
 ### Handling mismatches
 
@@ -676,9 +892,15 @@ $ lago-sync reconcile --month 2024-01
 
 **Diagnosis:**
 ```bash
-# Test the API directly
-curl -s -H "x-rh-identity: $(echo $KOKU_IDENTITY)" \
-  "http://localhost:8000/api/cost-management/v1/reports/aws/costs/?filter[start_date]=2024-01-01&filter[end_date]=2024-01-31" \
+# Test the API directly (SaaS — use OAuth2 token)
+TOKEN=$(curl -s -X POST "$TOKEN_URL" -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&scope=api.console" | python -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://console.redhat.com/api/cost-management/v1/reports/aws/costs/?start_date=2024-01-01&end_date=2024-01-31" \
+  | python -m json.tool | head -50
+
+# Or for local dev (x-rh-identity):
+curl -s -H "x-rh-identity: $KOKU_IDENTITY" \
+  "http://localhost:8000/api/cost-management/v1/reports/aws/costs/?start_date=2024-01-01&end_date=2024-01-31" \
   | python -m json.tool | head -50
 ```
 
@@ -698,8 +920,8 @@ If the response has `"data": []`, the issue is on the Cost Management side (data
 lago-sync sync --month 2024-01 --dry-run 2>&1 | grep "DRY RUN"
 
 # Inspect the raw API response to see actual dimension values
-curl -s -H "x-rh-identity: $(echo $KOKU_IDENTITY)" \
-  "http://localhost:8000/api/cost-management/v1/reports/aws/costs/?filter[start_date]=2024-01-01&filter[end_date]=2024-01-31&group_by[account]=*" \
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://console.redhat.com/api/cost-management/v1/reports/aws/costs/?start_date=2024-01-01&end_date=2024-01-31&group_by[account]=*" \
   | python -m json.tool
 ```
 
@@ -716,18 +938,24 @@ curl -s -H "x-rh-identity: $(echo $KOKU_IDENTITY)" \
 - Verify the plan exists: `curl -H "Authorization: Bearer $LAGO_API_KEY" http://localhost:3000/api/v1/plans/cloud_cost_passthrough`
 - Create charges manually in the Lago UI if the API endpoint differs
 
-### "Batch X failed (Y events lost)"
+### "Batch X: N events failed (M were duplicates, already billed)"
 
 **Symptoms:** Some events fail to push, others succeed.
 
-**Causes:**
+**What the deduplication handling does:**
+- If ALL failures in a batch are `transaction_id: value_already_exist` → treated as **success** (events already in Lago, no action needed)
+- If some failures are duplicates and some are real errors → only the real errors are counted as failures
+- Duplicate detection is logged at DEBUG level (not shown by default)
+
+**Real failure causes:**
 1. Transient Lago API error (will retry 3x automatically)
 2. Lago rate limiting (429)
 3. Network connectivity issue
+4. Invalid event payload
 
 **Fix:**
 - Check Lago server health
-- Re-run with `--force` to retry failed dates
+- Re-run with `--force` to retry failed dates (safe — duplicates are idempotent)
 - If persistent, check `lago-sync` logs for the specific error code
 
 ### "Configuration error: lago.api_key is required"
@@ -738,6 +966,28 @@ curl -s -H "x-rh-identity: $(echo $KOKU_IDENTITY)" \
 - Set the environment variable: `export LAGO_API_KEY=your_key_here`
 - Or set it directly in config.yaml (not recommended for production)
 - Find your API key in Lago: Settings → Developers → API Keys
+
+### "Cost Management authentication is not configured"
+
+**Symptoms:** CLI exits immediately with a config error about authentication.
+
+**Fix:** You must configure one of:
+- **OAuth2** (for SaaS): Set `COSTMGMT_CLIENT_ID` and `COSTMGMT_CLIENT_SECRET` environment variables, or configure `client_id` + `client_secret` in config.yaml
+- **Identity header** (for local dev): Set the `identity` field in config.yaml with a base64-encoded `x-rh-identity` header
+
+See the [Configuration Reference](#configyaml-structure) for examples of both.
+
+### "Currency mismatch: Cost Management reports X but customer is configured as Y"
+
+**Symptoms:** Error in sync log about currency mismatch.
+
+**Cause:** Cost Management reports costs in one currency (e.g., USD from the cloud provider's billing) but the Lago customer is configured with a different currency.
+
+**Fix:**
+- Option A: Change the customer's `currency` in `config.yaml` to match Cost Management's reporting currency
+- Option B: If you need multi-currency invoices, handle conversion externally and adjust `cost_amount` values before they reach Lago (requires code changes)
+
+**Why this matters:** Lago trusts the numeric values from events — if Cost Management reports $150 USD but the customer is set to EUR, Lago will bill €150. This check prevents silent billing errors.
 
 ### State database locked
 
@@ -851,7 +1101,7 @@ To develop against local instances:
 A: Yes. If multiple customer filters match the same leaf item, events are generated for both. This results in the cost appearing on both invoices. Design your filters to be mutually exclusive unless shared billing is intentional.
 
 **Q: What happens if Cost Management reprocesses data after I've synced?**
-A: Re-run with `--force`. Lago deduplicates by `transaction_id`, so identical items won't duplicate. If values changed, the new events will have the same `transaction_id` and Lago will use the latest value.
+A: Re-run with `--force`. The sync engine detects cost changes by comparing with the local state DB. If a cost changed, it pushes a **correction event** with the delta (`new_cost - old_cost`). Lago events are **additive** (not latest-value), so the correction ensures the sum of all events for that dimension/date equals the correct total. If the cost didn't change, the original `transaction_id` triggers a 422 duplicate which is safely ignored.
 
 **Q: How do I handle a customer leaving mid-month?**
 A: Remove the customer from `config.yaml`. Already-pushed events for the current period will still appear on their invoice. Terminate their subscription in Lago after the final invoice is generated.

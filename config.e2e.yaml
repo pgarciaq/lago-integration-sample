@@ -1,0 +1,23 @@
+lago:
+  api_url: "http://localhost:3000"
+  api_key: "210e20ce-909f-4bf3-8d42-954817ada505"
+
+cost_management:
+  base_url: "https://console.redhat.com/api/cost-management/v1"
+  client_id: "${COSTMGMT_CLIENT_ID}"
+  client_secret: "${COSTMGMT_CLIENT_SECRET}"
+  org_id: "e2e_test"
+
+sync:
+  ocp_include_overhead: true
+  invoice_group_by:
+    openshift: ["project", "cluster"]
+
+customers:
+  - external_id: "e2e_test_customer"
+    name: "E2E Test Customer"
+    currency: "USD"
+    resources:
+      - provider: openshift
+        filter:
+          project: ["*"]

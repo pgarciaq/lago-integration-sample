@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from lago_python_client.exceptions import LagoApiError
+
 from src.config import AppConfig, CostManagementConfig, CustomerConfig, LagoConfig, ResourceFilter, SyncConfig
 from src.lago_sync import LagoSync, SyncResult
 
@@ -24,6 +26,8 @@ def _make_sync(config):
     sync.config = config
     sync.org_id = config.cost_management.org_id
     sync.client = MagicMock()
+    sync._force_resend = False
+    sync._resend_suffix = ""
     return sync
 
 
@@ -252,3 +256,184 @@ def test_partial_batch_failure():
     assert result.batches_failed == 1
     assert result.events_failed == 3
     assert len(result.errors) == 1
+
+
+# --- Tests for new features ---
+
+
+def test_parse_batch_error_all_duplicates():
+    """Test that all-duplicate 422 is parsed as (N, 0) - all idempotent."""
+    sync = _make_sync(_make_config([
+        CustomerConfig(external_id="x", name="X", resources=[ResourceFilter(provider="aws", filter={"account": ["1"]})])
+    ]))
+    error = LagoApiError(
+        status_code=422, url="test", detail=None,
+        response={
+            "status": 422, "error": "Unprocessable Entity", "code": "validation_errors",
+            "error_details": {
+                "0": {"transaction_id": ["value_already_exist"]},
+                "1": {"transaction_id": ["value_already_exist"]},
+                "2": {"transaction_id": ["value_already_exist"]},
+            }
+        }
+    )
+    result = sync._parse_batch_error(error)
+    assert result == (3, 0)
+
+
+def test_parse_batch_error_mixed():
+    """Test mixed errors: some duplicates, some real failures."""
+    sync = _make_sync(_make_config([
+        CustomerConfig(external_id="x", name="X", resources=[ResourceFilter(provider="aws", filter={"account": ["1"]})])
+    ]))
+    error = LagoApiError(
+        status_code=422, url="test", detail=None,
+        response={
+            "status": 422, "error": "Unprocessable Entity", "code": "validation_errors",
+            "error_details": {
+                "0": {"transaction_id": ["value_already_exist"]},
+                "1": {"code": ["invalid_value"]},
+                "2": {"transaction_id": ["value_already_exist"]},
+            }
+        }
+    )
+    result = sync._parse_batch_error(error)
+    assert result == (2, 1)
+
+
+def test_parse_batch_error_non_422():
+    """Test that non-dedup errors return None."""
+    sync = _make_sync(_make_config([
+        CustomerConfig(external_id="x", name="X", resources=[ResourceFilter(provider="aws", filter={"account": ["1"]})])
+    ]))
+    error = Exception("Connection refused")
+    result = sync._parse_batch_error(error)
+    assert result is None
+
+
+def test_zero_cost_events_skipped():
+    """Test that events with cost_amount < 0.001 are not generated."""
+    customers = [
+        CustomerConfig(
+            external_id="cust_a",
+            name="A",
+            resources=[ResourceFilter(provider="openshift", filter={"project": ["*"]})],
+        ),
+    ]
+    config = _make_config(customers)
+    sync = _make_sync(config)
+
+    data = [
+        {
+            "date": "2024-01-15",
+            "projects": [
+                {
+                    "project": "active-project",
+                    "values": [{"project": "active-project", "cost": {"total": {"value": 50.0, "units": "USD"}, "raw": {"value": 50.0}, "markup": {"value": 0.0}, "usage": {"value": 0.0}}}]
+                },
+                {
+                    "project": "no-project",
+                    "values": [{"project": "no-project", "cost": {"total": {"value": 0.0, "units": "USD"}, "raw": {"value": 0.0}, "markup": {"value": 0.0}, "usage": {"value": 0.0}}}]
+                },
+            ],
+        }
+    ]
+    events, result = _extract(sync, "openshift", data, customers)
+
+    assert len(events) == 1
+    assert events[0].properties["cost_amount"] == "50.0"
+    assert result.events_skipped_zero == 1
+
+
+def test_currency_mismatch_detected():
+    """Test that currency mismatch between Koku and customer config is flagged."""
+    customers = [
+        CustomerConfig(
+            external_id="cust_eur",
+            name="Euro Customer",
+            currency="EUR",
+            resources=[ResourceFilter(provider="aws", filter={"account": ["123"]})],
+        ),
+    ]
+    config = _make_config(customers)
+    sync = _make_sync(config)
+
+    data = [
+        {
+            "date": "2024-01-15",
+            "accounts": [
+                {
+                    "account": "123",
+                    "values": [{"account": "123", "cost": {"total": {"value": 100.0, "units": "USD"}, "raw": {"value": 100.0}, "markup": {"value": 0.0}, "usage": {"value": 0.0}}}]
+                },
+            ],
+        }
+    ]
+    events, result = _extract(sync, "aws", data, customers)
+
+    assert len(result.errors) == 1
+    assert "Currency mismatch" in result.errors[0]
+    assert "USD" in result.errors[0]
+    assert "EUR" in result.errors[0]
+
+
+def test_stable_dim_key_normalization():
+    """Test that dimension key normalization strips whitespace but preserves case."""
+    sync = _make_sync(_make_config([
+        CustomerConfig(external_id="x", name="X", resources=[ResourceFilter(provider="aws", filter={"account": ["1"]})])
+    ]))
+    assert sync._stable_dim_key({"project": "Frontend"}) == "Frontend"
+    assert sync._stable_dim_key({"project": "  Frontend  "}) == "Frontend"
+    assert sync._stable_dim_key({"project": "frontend"}) == "frontend"
+    assert sync._stable_dim_key({}) == "total"
+    assert sync._stable_dim_key({"a": "X", "b": "Y"}) == "X_Y"
+
+
+def test_correction_events_generated_for_changed_costs():
+    """Test that delta correction events are produced when costs change."""
+    customers = [
+        CustomerConfig(
+            external_id="cust_a",
+            name="A",
+            resources=[ResourceFilter(provider="aws", filter={"account": ["123"]})],
+        ),
+    ]
+    config = _make_config(customers)
+    sync = _make_sync(config)
+
+    data = [
+        {
+            "date": "2024-01-15",
+            "accounts": [
+                {
+                    "account": "123",
+                    "values": [{"account": "123", "cost": {"total": {"value": 200.0, "units": "USD"}, "raw": {"value": 200.0}, "markup": {"value": 0.0}, "usage": {"value": 0.0}}}]
+                },
+            ],
+        }
+    ]
+
+    # Mock state that has an old cost for this event
+    mock_state = MagicMock()
+    # Simulate: the event was previously stored with cost $150
+    result = SyncResult(provider="aws")
+    events = sync._extract_events("aws", data, customers, result)
+
+    # Build event_records as _correct_changed_events now expects them
+    event_records = [
+        (e.transaction_id, e.properties.get("cost_amount", "0"), e.properties)
+        for e in events
+    ]
+
+    # Simulate find_changed_events returning the txn_id with old=150, new=200
+    txn_id = events[0].transaction_id
+    mock_state.find_changed_events.return_value = [(txn_id, "150.0", "200.0")]
+
+    sync._correct_changed_events(events, event_records, result, mock_state)
+
+    # A correction event should have been appended
+    correction_events = [e for e in events if "_correction_" in e.transaction_id]
+    assert len(correction_events) == 1
+    assert float(correction_events[0].properties["cost_amount"]) == 50.0  # delta: 200 - 150
+    assert correction_events[0].properties["_correction"] == "true"
+    assert result.events_corrected == 1
